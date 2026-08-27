@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+from typing import Never
 
 import pytest
 
@@ -79,6 +80,19 @@ class TestDispatch:
 
         monkeypatch.setattr("builtins.input", raise_eof)
         cli_setup._maybe_setup_cloud()  # must not raise
+        assert "Skipped" in capsys.readouterr().out
+
+    def test_setup_cloud_survives_undecodable(self, monkeypatch, capsys) -> None:
+        # KiroCrew setup should not exit/fail when it receives an unrecognizable input
+        # (i.e, incorrect/different encoding), instead, should gracefully skip like it would on eof
+
+        from kiro_crew import cli_setup
+
+        def raise_decode(_prompt) -> Never:
+            raise UnicodeDecodeError("utf-8", b"\xff\xfe", 0, 2, "invalid continuation byte")
+
+        monkeypatch.setattr("builtins.input", raise_decode)
+        cli_setup._maybe_setup_cloud()
         assert "Skipped" in capsys.readouterr().out
 
     def test_dispatch_validation_error_fails_cleanly(self, monkeypatch, capsys):

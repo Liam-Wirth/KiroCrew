@@ -414,8 +414,9 @@ def _maybe_setup_cloud() -> None:
     print("  AWS account; credentials stay in the aws CLI — never stored here).")
     try:
         answer = input("  Launch KiroCrew on AWS now? [y/N]: ").strip().lower()
-    except EOFError:
+    except (EOFError, UnicodeDecodeError):
         # Piped/non-interactive setup — take the default (skip).
+        # Or answer that is not UTF-8 or in some other codec (some cloud environments use POSIX/C)
         answer = ""
     if answer not in ("y", "yes"):
         print("  ⏭  Skipped. Launch later: kirocrew cloud launch\n")
