@@ -51,14 +51,17 @@ from kiro_crew.dashboard.handlers.usage import (
 )
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.hooks import validate_file_path
-from kiro_crew.metrics.provider import TELEMETRY_ENV_VAR, env_pin
+from kiro_crew.metrics.provider import TELEMETRY_ENV_VAR, env_pin, otlp_egress_active
 from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
+from kiro_crew.metrics.turns import TURN_METRIC
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
 _STARTUP_METRIC = "kirocrew.session.startup.duration"
-_TURN_METRIC = "kirocrew.turn.duration"
+# Read from the emitter's own constant rather than re-spelled: a reader and an
+# emitter naming the instrument differently is a silently empty panel.
+_TURN_METRIC = TURN_METRIC
 # The end-to-end startup point. The claude path emits no ``phase`` attribute at
 # all, so an absent phase is treated as the total (see _aggregate).
 _PHASE_TOTAL = "total"
@@ -96,11 +99,17 @@ _OTHER_SPLIT_ATTRS = frozenset({"warm"})
 # budget already spent dies with "start a new chat" — the emit site labels
 # it distinctly so the recovered-stall exclusion cannot hide dead sessions,
 # and fault_rate stays a single-series computation.
-# Every entry here must have a producer: either a _turn_outcome return label
+# Every entry here must have a producer: either a turn_outcome return label
 # or "unknown" (minted by this aggregator for attribute-less points) — the
 # cross-module test enforces that, so a dead entry (e.g. a "cancelled" label
 # nothing ever emitted — user cancels map to "error") cannot linger and
 # mislead readers about what fault_rate counts.
+# "unclassified" is deliberately ABSENT: it marks a turn whose surface had no
+# stop reason to give (a bare TurnUsage at a helper call site), so counting it
+# would invent a fault for every clean background turn the moment this metric
+# started sampling them. It is not folded into "ok" either — it stays its own
+# slice in the outcome breakdown so the blind spot is visible rather than
+# resolved by a guess in either direction.
 _TERMINAL_FAULT_OUTCOMES = frozenset({"error", "timeout", "unknown", "stall_exhausted"})
 
 # (shard-fingerprint, TTL) cache — shards are append-only, so a change to any
@@ -145,9 +154,22 @@ def _telemetry_cfg() -> _TelemetryState:
         enabled = bool(cfg.enabled)
         if getattr(cfg, "local_dir", None):
             directory = Path(cfg.local_dir).expanduser()
-        # Presence only. The endpoint string can carry credentials, so it never
-        # leaves this function; the panel only needs to know one is configured.
-        otlp_configured = bool(str(getattr(cfg, "otlp_endpoint", "") or "").strip())
+        # Presence only, and resolved the same way _build_recorder resolves it:
+        # from the active telemetry provider's destination set, NOT from the
+        # endpoint string. An edition that supplies its own collector must not be
+        # able to leave this panel reporting "nothing is exported" while metrics
+        # leave the machine. The endpoint value never leaves that resolution; the
+        # panel only needs to know whether egress would happen.
+        try:
+            otlp_configured = otlp_egress_active(cfg)
+        except Exception:
+            # Posture unresolvable (a provider that raised, an uncomposable
+            # context). Report egress rather than promising local-only: this
+            # answer is a DISCLOSURE, so its closed direction is "assume it
+            # exports". The panel then disables the enable direction instead of
+            # offering a write the config route refuses with 409 anyway.
+            logger.debug("OTLP egress posture unresolvable; reporting egress", exc_info=True)
+            otlp_configured = True
     except Exception:
         logger.debug("telemetry config load failed; assuming disabled", exc_info=True)
     env_var = TELEMETRY_ENV_VAR
@@ -948,13 +970,24 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     turn_outcome = turn.outcomes
     turn_total = sum(turn_outcome.values())
     turn_faults = sum(v for k, v in turn_outcome.items() if k in _TERMINAL_FAULT_OUTCOMES)
+    # fault_rate is computed over the turns whose outcome is KNOWN, not over every
+    # turn. ``unclassified`` marks a turn whose surface had no stop reason to give
+    # (a helper call site passing a bare TurnUsage), and it cannot go in either
+    # position honestly: in the numerator it invents a fault for every clean
+    # background turn, and in the denominator alone it silently dilutes the rate
+    # towards zero as background traffic grows — an optimistic dashboard, which is
+    # the failure mode this metric's widening was supposed to end. Excluded from
+    # both. The count needs no field of its own: it already ships in this same
+    # response as ``outcome["unclassified"]``, so a reader can see exactly how
+    # much of the window fault_rate does not cover.
+    turn_classified = turn_total - turn_outcome.get("unclassified", 0)
     turn_block = {
         # ``other_generations`` arrives via stats(): >0 means the window
         # straddles a bucket-boundary change and only the dominant generation
         # is reported (see _Hist).
         **turn.stats(),
         "outcome": turn_outcome,
-        "fault_rate": round(turn_faults / turn_total, 4) if turn_total else 0.0,
+        "fault_rate": round(turn_faults / turn_classified, 4) if turn_classified else 0.0,
     }
 
     return {
@@ -1409,7 +1442,11 @@ async def api_collection_status(request: web.Request) -> web.Response:
     ignores, and ``overlay_override`` does the same for a ``config.local.json``
     entry that would make the switch snap back after a successful save.
 
-    ``otlp_configured`` reports that ``telemetry.otlp_endpoint`` is set. That makes
+    ``otlp_configured`` reports that enabling collection would send metrics off
+    this machine — resolved from the active telemetry provider's destination set,
+    the same one ``_build_recorder`` attaches readers for, not from the
+    ``telemetry.otlp_endpoint`` string (which is only how the DEFAULT provider
+    names a destination; an edition may supply its own collector). That makes
     collection not-local — ``_build_recorder`` attaches an OTLP reader — so the
     config route refuses to ENABLE it from here and the panel disables that
     direction rather than offering a write that comes back 409. Disabling stays

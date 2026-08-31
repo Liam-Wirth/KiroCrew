@@ -714,12 +714,14 @@ def _input_or_skip(prompt: str) -> str | None:
     as "keep the default / skip this step". A closed/piped stdin is a different
     condition and must not be silently coerced to ``""`` (that used to admit an
     empty default and cascade the failure into the NEXT step's bare
-    ``input()``) — see ``_SetupAborted``.
+    ``input()``) — see ``_SetupAborted``. A non-UTF-8 locale (e.g. C/POSIX)
+    makes ``input()`` raise ``UnicodeDecodeError`` the same way, so it is
+    treated identically.
     """
 
     try:
         answer = input(prompt).strip()
-    except EOFError as exc:
+    except (EOFError, UnicodeDecodeError) as exc:
         raise _SetupAborted("stdin closed; setup cannot continue") from exc
     return answer or None
 

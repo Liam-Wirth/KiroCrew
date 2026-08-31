@@ -1,17 +1,30 @@
-"""Agent-question HTTP API — render a question card and block for the answer.
+"""Agent-question HTTP API — question-card state, and a blocking ask round-trip.
 
-Two endpoints form one blocking round-trip:
+Cards come in two kinds and these routes serve both. A card carrying an
+``ask_id`` has a server-side wait behind it; a card carrying a ``card_id`` is
+stateless and blocks nothing. The MCP ``ask_question`` tool produces the
+stateless kind — it returns a session directive and the agent ends its turn (see
+:func:`kiro_crew.mcp_tools.control.ask_question`), so it does NOT call the POST
+below.
 
 ``POST /api/ask-question``
-    Called by the ``ask_question`` MCP tool. Validates the question payload,
-    broadcasts a ``question_card`` to the owning slot's dashboard clients, and
-    holds the request open until the user answers (or the window elapses).
+    Opens a blocking ask: validates the payload, broadcasts a ``question_card``
+    with an ``ask_id`` to the owning slot's dashboard clients, and holds the
+    request open until the user answers or the window elapses. No in-tree caller
+    uses it now that the MCP tool is directive-based; it remains supported.
 
 ``POST /api/ask-question/{ask_id}/answer``
-    Called by the dashboard when the user submits (or dismisses) the card.
-    Resolves the blocked request above.
+    Called by the dashboard when the user submits or dismisses such a card.
+    Resolves the wait above.
 
-This mirrors the tool-approval round-trip in
+``GET /api/ask-question/pending``
+    Read-only rehydration after a reload or websocket reconnect, since
+    ``question_card`` is a one-shot broadcast. Returns both kinds.
+
+``POST /api/ask-question/dismiss``
+    Retires a STATELESS card's pending state. It cannot resolve a blocking wait.
+
+The blocking half mirrors the tool-approval round-trip in
 :meth:`kiro_crew.dashboard.state.DashboardState.request_approval` — the
 difference is that the resolution value is the user's answer map rather than an
 allow/deny boolean, and the card is addressed to a single slot.
@@ -25,10 +38,7 @@ import uuid
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
-from kiro_crew.dashboard.handlers.source_providers import (
-    is_owner_dashboard_request,
-    stale_owner_session_response,
-)
+from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
@@ -115,8 +125,15 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
     is configured. That matches the identity the ``ask_question`` MCP tool
     itself carries, since its token is minted as ``owner_id or "local-app"``.
     """
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+
     if is_owner_dashboard_request(request):
         return None
+    # Domain-specific audit kept here rather than delegated to
+    # ``require_owner_dashboard_request``: this record carries the endpoint as
+    # ``resources`` plus an ``error`` reason, which the shared helper's generic
+    # ``non_owner_block`` record does not. Only the denial TAIL (stale-session
+    # relabel + 403) is shared -- see ``_owner_denial_response``.
     try:
         sel().log_api_access(
             caller=str(request.get("user") or "anonymous"),
@@ -130,10 +147,7 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
         logger.warning("SEL audit failed for non-owner denial", exc_info=True)
     # Deny decision made above; only the response label changes for a signed
     # pre-owner bootstrap subject (see stale_owner_session_response).
-    stale = stale_owner_session_response(request)
-    if stale is not None:
-        return stale
-    return web.json_response({"error": "forbidden", "code": "owner_only"}, status=403)
+    return _owner_denial_response(request, "forbidden", "owner_only")
 
 
 async def api_ask_question(request: web.Request) -> web.Response:

@@ -85,7 +85,13 @@ import ChatSidebar from '../pages/ChatSidebar'
 import type { RootState } from '../store'
 import type { ChatSlot } from '../types'
 
-const LAST_TS = '2026-08-26T18:00:00Z'
+// RELATIVE, not a literal date: the sidebar's dormant-session collapse
+// (staleCollapse.ts, default threshold 2 days) hides any row whose last
+// activity is older than the threshold, and these tests address rows by
+// title, so a hardcoded date turns into a time bomb — the fixture aged past
+// the threshold two days after it was written and all ten tests started
+// failing on every PR at once. A minute ago is always fresh.
+const LAST_TS = new Date(Date.now() - 60_000).toISOString()
 
 const SLOTS: ChatSlot[] = [
   // The divergence: bound to a `mochi` that nothing dispatches, so `kirocrew`
@@ -146,7 +152,18 @@ function markerFor(container: HTMLElement, title: string): HTMLElement | null {
   return metaLineFor(container, title).querySelector('[data-testid="session-effective-agent"]')
 }
 
-beforeEach(() => localStorage.clear())
+// `LAST_TS` is a fixed wall-clock instant while the stale-session collapse
+// measures age against `Date.now()`, so this file's rows drift into dormancy on
+// their own: they were 1.6 days old when the collapse shipped and passed, then
+// crossed the 2-day default at 2026-08-28T18:00Z and every row-by-title lookup
+// below started throwing `no row titled ...` with no code change in between.
+// Pinning the threshold off keeps the rows queryable and makes the file's age
+// irrelevant; the collapse's own behavior is pinned in
+// ChatSidebar.staleCollapse.test.tsx, which is where it belongs.
+beforeEach(() => {
+  localStorage.clear()
+  localStorage.setItem('mc-session-stale-collapse-ms', '0')
+})
 afterEach(() => vi.clearAllMocks())
 
 describe('chat sidebar — effective-agent marker', () => {

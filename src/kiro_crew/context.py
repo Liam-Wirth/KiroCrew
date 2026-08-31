@@ -1053,7 +1053,24 @@ def _load_steering_resources() -> str:
         cfg_path = kiro_agents_dir() / "kirocrew.json"
         if not cfg_path.exists():
             return ""
-        cfg = json.loads(safe_read_file(str(cfg_path)))
+        # The agents dir is user-writable and shared with other tools, so the
+        # spec goes through the hardened agent-spec reader. ``safe_read_file``
+        # screened the resolved target but read it with an unbounded
+        # ``fh.read()`` -- the size cap guards ``safe_read_file_bytes``, the
+        # other helper -- and emitted no SEL event, so an oversized spec was
+        # still read whole here and a refusal was never audited. Every outcome
+        # the blanket ``except`` below used to absorb (PermissionError on a
+        # sensitive target, AttributeError on non-object JSON) now arrives as
+        # ``None`` and returns the same empty string, without the read.
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        cfg = _read_agent_spec(
+            cfg_path,
+            operation="steering_resources",
+            source="unknown",
+        )
+        if cfg is None:
+            return ""
         resources = cfg.get("resources", [])
         parts: list[str] = []
         home_resolved = str(Path.home().resolve()) + os.sep
@@ -1137,6 +1154,13 @@ _CRITICAL_RULES_TAIL = (
     '"Yes, delete it"). Never phrase a label in your own voice or as your own '
     'next action ("I\'ll merge it", "Let me show the diff", "I can rebase '
     'first"), and never phrase it as a question back to the user.\n'
+    "Every option must be SELF-CONTAINED: each rendered chip carries its own "
+    "send control, so the user can send any single option alone, and ONLY that "
+    "option's text is sent -- none of its siblings come with it. Never write "
+    'an option that only makes sense combined with another one ("Build the '
+    'widget" | "Include the stop button too" -- sent alone, the second names '
+    "no action). Fold the shared base action into each label instead "
+    '("Build the widget with the stop button included").\n'
     "[END CRITICAL RULES]\n\n"
 )
 # The dashboard variant is the module's canonical block: tests and the
@@ -1917,8 +1941,13 @@ class ContextBuilder:
                 "are about to do, what you just did, rationale, alternatives "
                 "you rejected, caveats, trade-offs, unprompted next steps, and "
                 "closing offers to help.\n"
-                "- A change, a command, or a value IS the answer. Show it and "
-                "stop; do not narrate it.\n"
+                "- Whatever the user needs in order to know or to act IS the "
+                "answer — a change, a command, a value, a verdict. Lead with "
+                "it and stop; do not narrate it. The work that produced it — "
+                "the evidence, the search, the options you weighed — is "
+                "explanation, so it is opt-in like the rest. Naming your "
+                "findings is not naming the answer: if the user has to derive "
+                "it from what you found, you have not answered.\n"
                 "- One exception to stopping: when that command or change "
                 "destroys, overwrites or rewrites something, the undo path "
                 "rides along with it in the same reply — how to get it back, "
@@ -1934,7 +1963,23 @@ class ContextBuilder:
                 "Take a position instead of listing options.\n"
                 "- Code, commands, paths, identifiers, error strings and file "
                 "contents stay verbatim and complete — this mode cuts prose, "
-                "never payload.\n"
+                "never payload. Payload is what the user asked for or has to "
+                "act on. Material you quote to prove a point is evidence, not "
+                "payload, and evidence is opt-in: leave it out and offer it.\n"
+                "- One sentence per thing you are telling them. The verdict is "
+                "a sentence; each recommendation is a sentence; each item in a "
+                "list is a sentence. This bounds each item, not the reply, so "
+                "a procedure that genuinely needs seven steps gets seven "
+                "one-sentence steps — but a reply that has grown sections, "
+                "numbered findings or bullets with sub-bullets is a report, "
+                "and the answer is buried inside it.\n"
+                "- Verify against the real thing, then answer without showing "
+                "the work. Reading the code, the log or the document is what "
+                "keeps you from being wrong; a file path, a line number, a "
+                "quoted function or a count of the steps you took only shows "
+                "that you read it. Say what the thing does, not where you "
+                "found it, and hand the reference over when the user asks to "
+                "check it.\n"
                 "- The moment the user asks why, asks you to explain, or asks "
                 "for a doc, review, walkthrough or deep dive, this mode is off "
                 "for that reply: give the full detail they asked for.\n\n"
@@ -3133,7 +3178,9 @@ class ContextBuilder:
                 "as the very last line — exactly once, nothing after it. "
                 "Users can select multiple options before submitting. Label each choice "
                 'in the user\'s voice as an instruction to you — "Merge it now", not '
-                '"I\'ll merge it".)'
+                '"I\'ll merge it". Make each choice self-contained — any single one can '
+                "be sent alone, so never write a choice that merely modifies a sibling "
+                '("Include the stop button too"); fold the base action into it.)'
             )
             # Situational nudges for tools that may otherwise never surface with
             # MCP Tool Search. Gated on having a dashboard tab open, because
@@ -3143,17 +3190,19 @@ class ContextBuilder:
             # wants none of the Crew's dashboard-tool nudges (it drives its own
             # UI through its MCP tools), so honor that here too, not just for
             # _CRITICAL_RULES.
-            # ask_question is a MID-turn blocking decision; [OPTIONS:] remains
-            # the cheaper END-turn choice mechanism on every interactive surface.
+            # ask_question posts a NON-BLOCKING card and the agent ends its turn:
+            # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
+            # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 parts.append(
-                    "\n\n(If you need the user's answer to a blocking question BEFORE "
-                    "you can continue the current turn, use the ask_question tool — it "
-                    "pauses and returns the answer as the tool result. Use it SPARINGLY: "
-                    "only when you genuinely cannot proceed without the answer. When you "
-                    "are ENDING your turn, use the final [OPTIONS:] line instead. Never "
-                    "interrupt the user for a non-blocking choice, and never ask what you "
-                    "can reasonably decide or discover yourself.)"
+                    "\n\n(If a decision is genuinely needed before the work can "
+                    "continue, use the ask_question tool to put it to the user as a card, "
+                    "then END YOUR TURN: the tool does not block, and the answer arrives "
+                    "as the user's next message rather than as the tool's result. Use it "
+                    "SPARINGLY: only when you cannot proceed without the answer. When you "
+                    "are ending your turn anyway, use the final [OPTIONS:] line instead. "
+                    "Never interrupt the user for a non-blocking choice, and never ask "
+                    "what you can reasonably decide or discover yourself.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.

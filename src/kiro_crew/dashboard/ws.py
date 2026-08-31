@@ -73,6 +73,11 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
     data: dict = {
         "id": a.id,
         "slot": subagent_event_slot(a.parent_session_key),
+        # The sub-agent's OWN session key (where it writes its ctx_blocks /
+        # token rows), so a client can fetch this node's own context-trace and
+        # render its window composition. Mirrors the run key derived in
+        # SubagentManager._run: `conversation_key or subagent:<id>`.
+        "child_session": getattr(a, "conversation_key", "") or f"subagent:{a.id}",
         "task": _r(a.task),
         "agent": _r(a.agent),
         "model": a.resolved_model,
@@ -428,6 +433,13 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         # malformed entry (see its docstring).
         if ws.get("_is_dashboard_user", False):
             envelope_extras["folders"] = _safe_folder_tree(getattr(state, "_folders", None))
+            # Baseline for the change comparison, alongside the tree it describes
+            # — the client treats a connection's first generation as "unknown,
+            # refetch", so this seeds the number a later bump is measured against.
+            # Gated with `folders` rather than sent unconditionally: an app token
+            # never receives the tree, so its generation would describe data the
+            # app does not have.
+            envelope_extras["foldersGeneration"] = state.folders_generation()
         if not ws.get("_is_dashboard_user", False) and "yolo" in envelope_extras:
             # Handing an app token the live blanket-approval override is a
             # grant of operator security posture, not slot data, and this
@@ -719,6 +731,8 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                             "data": {
                                                 "id": a.id,
                                                 "slot": slot,
+                                                "child_session": getattr(a, "conversation_key", "")
+                                                or f"subagent:{a.id}",
                                                 "elapsed": a.elapsed,
                                                 "error": _r(a.error) if a.error else None,
                                                 "stopped": a.user_stopped,

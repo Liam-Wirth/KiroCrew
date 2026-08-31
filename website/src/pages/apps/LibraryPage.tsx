@@ -2,14 +2,19 @@
  * LibraryPage — installed-app management, split out of the old AppsPage
  * (PR1 App Store split; route `/apps/library`).
  *
- * Pending-updates banner with Update All, search, the management cards
- * (InstalledAppCard), and the uninstall preview flow — all moved unchanged
- * from AppsPage's library branch. Data identity (installed list, update map,
- * mc:apps-changed announcement) lives in the shared `useAppsData` hook so
- * this page and Discover cannot drift.
+ * The list presentation is a macOS-Launchpad-style icon grid (PR3, approved
+ * mockup frame #a): each installed app is a `LaunchpadTile` whose pin badge
+ * toggles whether the app appears in the sidebar (persisted as the HIDDEN
+ * set under `mc-app-nav-hidden`, owned by `lib/appNavHidden.ts`), with a
+ * hover action bar carrying the management verbs the old cards offered.
+ * Search and the uninstall preview flow survive from the card list. Data
+ * identity (installed list, update map, mc:apps-changed announcement) lives
+ * in the shared `useAppsData` hook so this page and Discover cannot drift.
  *
- * PR1 constraint: the update banner's behavior is UNCHANGED here — PR2 owns
- * any banner changes.
+ * Pending updates surface here as a light one-line hint linking to the
+ * Discover Updates sub-page (`/apps/-/updates`), which owns the update
+ * worklist and Update All (PR2 App Store split). Per-tile Update stays on
+ * the action bar via the shared `useAppUpdates` hook.
  */
 import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
@@ -21,15 +26,17 @@ import { api } from '../../api/client'
 import { appNavTarget } from '../../appNav'
 import { Btn, EmptyState, PageHeader, SearchInput } from '../../components/ui'
 import { recordEvent } from '../../rum'
-import InstalledAppCard from '../../components/appstore/InstalledAppCard'
 import TrustAppModal, { isTrustDeniedError } from '../../components/appstore/TrustAppModal'
-import { isRegistrySourced, type InstalledApp } from '../../components/appstore/types'
+import type { InstalledApp } from '../../components/appstore/types'
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import { toggleAppNavHidden, useAppNavHidden } from '../../lib/appNavHidden'
 import useAppsData from './useAppsData'
 import { useAppActions } from './useAppActions'
+import { useAppUpdates } from './useAppUpdates'
 import { cardDataKey } from './cardDataKey'
+import LaunchpadTile from './LaunchpadTile'
 
 /** Uninstall preview payload (mirrors ``api.uninstallPreview`` return shape). */
 type UninstallPreview = Awaited<ReturnType<typeof api.uninstallPreview>>
@@ -46,14 +53,53 @@ export default function LibraryPage() {
 
   const [query, setQuery] = useState('')
   const [successMsg, setSuccessMsg] = useState('')
-  const [successLink, setSuccessLink] = useState(false)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
-  const [updatingAll, setUpdatingAll] = useState<{ done: number; total: number } | null>(null)
+  // `openCommand` apps opened from a remote/headless gateway cannot launch
+  // here — the backend answers `{remote: true, command}` and the user runs
+  // the command locally instead.
+  const [remoteCmd, setRemoteCmd] = useState('')
 
   const {
     setError, displayError, dismissError,
     openDetail, updateApp, trustTarget, runEnable, trust,
   } = useAppActions({ apps, browseApps, appsError, registryError, announceAppsChanged })
+
+  // Transient success surface for the shared update hook: the hook reports
+  // outcomes, this page owns display + auto-dismiss (same 4s the other
+  // toasts here use).
+  const showSuccess = (msg: string) => {
+    setSuccessMsg(msg)
+    setTimeout(() => setSuccessMsg(''), 4000)
+  }
+
+  // Per-row update comes from the shared useAppUpdates hook (PR2), so this
+  // page and the Discover Updates sub-page cannot drift on how an update
+  // behaves. The recorded-source routing comment lives there. Update All is
+  // the Updates sub-page's affordance now — this page only hints (below).
+  const { updatingAll, updatePending, runUpdate } = useAppUpdates({
+    apps, updatables, announceAppsChanged, updateApp,
+    setError, setSuccess: showSuccess,
+  })
+
+  // Which sidebar rows the user unpinned (`mc-app-nav-hidden`) — held as
+  // React state, not a raw read, so a pin toggle repaints every tile's badge
+  // at once. The module's own event covers same-tab writes (this page's
+  // toggles included, via the module's dispatch-on-write); the `storage`
+  // listener covers a toggle made in ANOTHER tab — the same two-listener
+  // shape App.tsx's sidebar filter uses.
+  const navHidden = useAppNavHidden()
+
+  // Pin toggle — resolve the tile's app to the SAME nav id the sidebar rows
+  // carry (`appNavTarget(app).id`, the rail's own derivation) and flip it in
+  // the persisted hidden set. The module's write dispatches the sync event,
+  // which feeds the state above and App.tsx's sidebar filter — no local
+  // set-state here. A tile without a nav target never offers the toggle
+  // (`pinnable` below), so the null branch is only a race guard.
+  const togglePin = (name: string) => {
+    const app = installedApps.find(a => a.name === name)
+    const id = app ? appNavTarget(app)?.id : undefined
+    if (id) toggleAppNavHidden(id)
+  }
 
   // Uninstall confirmation state
   const [uninstallTarget, setUninstallTarget] = useState<InstalledApp | null>(null)
@@ -101,54 +147,15 @@ export default function LibraryPage() {
       }
       return
     }
-    // Update dispatches on the RECORDED SOURCE, mirroring ``handle_update_app``'s
-    // own branch. A registry-sourced app is re-cloned from its registry and the
-    // detail page owns that flow (streaming log plus the trust consent modal), so
-    // it navigates there. An app installed from a path has no registry row: it is
-    // refreshed in place from the directory recorded at install — the same call
-    // Update All makes — and routing it at the registry instead failed every sync
-    // with "not found in registry". A row absent from this list carries no source
-    // to read, so it navigates and the detail page re-dispatches on the record it
-    // loads. Blocked while Update All is running so the same update can't run
-    // twice concurrently.
-    if (action === 'update') {
-      if (updatingAll) return
-      const target = apps.find(a => a.name === name)
-      if (!target || isRegistrySourced(target)) {
-        updateApp(name)
-        return
-      }
-    }
+    // Update routing (recorded-source dispatch, per-app pending state, the
+    // Update-All concurrency guard) is the shared hook's contract now.
+    if (action === 'update') return runUpdate(name)
     setActionLoading(`${name}:${action}`)
     setError('')
     try {
       if (action === 'enable') await runEnable(name)
       else if (action === 'disable') await api.disableApp(name)
-      else if (action === 'update') await api.updateApp(name)
       announceAppsChanged()
-      // An in-place sync is the one action here whose success is otherwise
-      // INVISIBLE: re-copying a source directory usually carries the same
-      // version, so the card re-renders byte-identical and the dev cannot tell
-      // whether new bytes landed. Reflect it the way `disable` already does.
-      if (action === 'update') {
-        const app = apps.find(a => a.name === name)
-        setSuccessMsg(i18nT('pages.appsPage.synced_from_its_source_directory', {
-          name: app?.displayName || name,
-        }))
-        setTimeout(() => setSuccessMsg(''), 4000)
-      }
-      // Show toast when hiding a builtin app
-      if (action === 'disable') {
-        const app = apps.find(a => a.name === name)
-        if (app?.origin === 'builtin') {
-          // A disabled overlay-less builtin leaves this list (keepInLibrary),
-          // so the recovery affordance is its catalog row on the Discover
-          // shelf — the toast points there and carries the link.
-          setSuccessMsg(i18nT('pages.appsPage.hidden_you_can_re_enable_it_from_the_discover_ta'))
-          setSuccessLink(true)
-          setTimeout(() => { setSuccessMsg(''); setSuccessLink(false) }, 4000)
-        }
-      }
     } catch (e) {
       if (action === 'enable' && isTrustDeniedError(e)) trust.open(trustTarget(name))
       else setError((e as Error)?.message || i18nT('pages.appsPage.action_failed', { action, name }))
@@ -172,29 +179,6 @@ export default function LibraryPage() {
       setActionLoading(null)
       setUninstallTarget(null)
       setUninstallPreview(null)
-    }
-  }
-
-  const updateAll = async () => {
-    if (updatingAll) return
-    const targets = updatables.map(a => a.name)
-    setUpdatingAll({ done: 0, total: targets.length })
-    setError('')
-    const failed: string[] = []
-    for (let i = 0; i < targets.length; i++) {
-      try {
-        await api.updateApp(targets[i])
-      } catch {
-        failed.push(targets[i])
-      }
-      setUpdatingAll({ done: i + 1, total: targets.length })
-    }
-    setUpdatingAll(null)
-    announceAppsChanged()
-    if (failed.length) setError(i18nT('pages.appsPage.failed_to_update', { names: failed.join(', ') }))
-    else {
-      setSuccessMsg(i18nT('pages.appsPage.updated_app', { count: targets.length }))
-      setTimeout(() => setSuccessMsg(''), 4000)
     }
   }
 
@@ -230,15 +214,28 @@ export default function LibraryPage() {
         {successMsg && (
           <div className="mb-4 bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--ok) 45%, transparent)' }}>
             <span className="text-text text-sm flex-1">{successMsg}</span>
-            {/* Set only by the disable-builtin toast: the row this action
-                removed re-enables from its Discover catalog row, so the toast
-                carries the navigation instead of naming a page and hoping. */}
-            {successLink && (
-              <Link to="/apps" className="text-accent text-sm font-medium hover:underline shrink-0">
-                {i18nT('nav.discover')}
-              </Link>
-            )}
-            <button aria-label={i18nT('pages.appsPage.dismiss_message')} className="text-muted hover:text-text text-sm" onClick={() => { setSuccessMsg(''); setSuccessLink(false) }}><X className="lucide-inline" /></button>
+            <button aria-label={i18nT('pages.appsPage.dismiss_message')} className="text-muted hover:text-text text-sm" onClick={() => setSuccessMsg('')}><X className="lucide-inline" /></button>
+          </div>
+        )}
+
+        {remoteCmd && (
+          <div
+            className="mb-4 bg-accent/10 border border-accent/20 rounded-lg p-3 text-[13px] animate-rise"
+            ref={el => {
+              // The clicked tile can be scrolled far below this notice; without
+              // bringing it into view the Open click looks like a no-op on a
+              // remote gateway (UX finding: off-locus feedback).
+              el?.scrollIntoView({ block: 'nearest' })
+            }}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <span className="text-text font-medium">{i18nT('components.appstore.installedAppCard.remote_environment_detected')}</span>
+                <p className="text-muted mt-1">{i18nT('components.appstore.installedAppCard.run_this_on_your_local_machine')}</p>
+                <code className="block mt-1.5 bg-bg-elevated px-2 py-1 rounded text-[12px] font-mono select-all">{remoteCmd}</code>
+              </div>
+              <button aria-label={i18nT('components.appstore.installedAppCard.dismiss')} className="text-muted hover:text-text text-sm shrink-0" onClick={() => setRemoteCmd('')}><X className="lucide-inline" /></button>
+            </div>
           </div>
         )}
 
@@ -266,7 +263,8 @@ export default function LibraryPage() {
             onKeyDown={e => { if (e.key === 'Escape') { setUninstallTarget(null); setUninstallPreview(null) } }}
             tabIndex={-1} ref={el => el?.focus()} role="dialog" aria-modal="true" aria-label={i18nT('pages.appsPage.confirm_uninstall')}
           >
-            {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events */}
+            {/* Stop clicks inside the dialog card from reaching the backdrop's
+                dismiss handler; presentation-only, no interaction of its own. */}
             <div role="presentation" className="bg-card border border-border rounded-xl p-6 max-w-md w-full mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
               <div className="flex items-center gap-3 mb-4">
                 <div className="w-10 h-10 rounded-xl bg-danger/10 flex items-center justify-center">
@@ -405,41 +403,49 @@ export default function LibraryPage() {
         ) : (
           <>
             {updatables.length > 0 && (
-              <div className="mb-4 border border-[color-mix(in_srgb,var(--info)_45%,transparent)] bg-bg-elevated rounded-lg p-3 flex items-center gap-3 animate-rise">
-                <ArrowUp size={15} className="text-[var(--info)] shrink-0" />
-                <span className="text-text text-sm flex-1">
-                  {i18nT('pages.appsPage.update', { count: updatables.length })} {i18nT('pages.appsPage.available')}
-                </span>
-                <Btn
-                  className="!bg-[var(--info)] !text-white hover:!opacity-80"
-                  onClick={updateAll}
-                  disabled={!!updatingAll}
-                >
-                  {updatingAll ? i18nT('pages.appsPage.updating_progress', { done: updatingAll.done, total: updatingAll.total }) : i18nT('pages.appsPage.update_all')}
-                </Btn>
+              /* Light hint, not a banner: the update WORKLIST (rows, version
+                 diffs, Update All) lives on the Discover Updates sub-page —
+                 this row only says updates exist and hands off there. Per-row
+                 Update on the cards below still works via the shared hook. */
+              <div className="mb-4 flex items-center gap-2 text-[13px] text-muted animate-rise">
+                <ArrowUp size={13} className="shrink-0" aria-hidden />
+                <span>{i18nT('pages.appsPage.updates_hint', { count: updatables.length })}</span>
+                <Link to="/apps/-/updates" className="text-accent font-medium hover:underline shrink-0">
+                  {i18nT('pages.appsPage.updates_hint_link')}
+                </Link>
               </div>
             )}
-            <div className="space-y-3">
-              {filteredInstalled.map(app => (
-                <ErrorBoundary
-                  /* Full-data key (cardDataKey): the boundary latches
-                     its error state, so remount when the installed app or its
-                     update availability changes — e.g. when an updated payload
-                     fixes a broken card (#3719). */
-                  key={cardDataKey(app)}
-                  scope="apps:installed-card"
-                  fallback={
-                    <div className="border border-border rounded-lg p-4 flex items-center gap-3">
-                      <AlertTriangle aria-hidden className="lucide-inline text-[var(--warn)] shrink-0" />
-                      <div className="min-w-0 text-sm flex-1">
-                        <span className="font-medium text-text">{app.manifest?.displayName || app.name}</span>
-                        <span className="text-muted ml-2">{i18nT('pages.appsPage.this_app_could_not_be_displayed')}</span>
-                      </div>
-                      {/* The crashed card removed the app's management surface, so the
-                          fallback must keep one recovery path: quiet a broken enabled
-                          app, or remove a disabled one entirely (locked apps cannot
-                          be uninstalled). Same handlers as the healthy card. */}
-                      <div className="shrink-0">
+            {/* Launchpad grid (mockup frame #a): ~5 columns at desktop width,
+                stepping down responsively. Tiles come from `installedApps`
+                (GET /api/apps records) — the Discover/Library built-in
+                SURFACES are frontend nav entries, never installed-app
+                records, so they cannot appear as tiles. */}
+            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 xl:grid-cols-6 gap-x-3 gap-y-7">
+              {filteredInstalled.map(app => {
+                // The sidebar's own eligibility/id derivation decides
+                // pinnability: a tile only offers a pin for a row the rail
+                // could actually show, under the byte-identical id the
+                // sidebar filter matches against.
+                const target = appNavTarget(app)
+                return (
+                  <ErrorBoundary
+                    /* Full-data key (cardDataKey): the boundary latches
+                       its error state, so remount when the installed app or its
+                       update availability changes — e.g. when an updated payload
+                       fixes a broken tile (#3719). */
+                    key={cardDataKey(app)}
+                    scope="apps:installed-card"
+                    fallback={
+                      <div className="flex flex-col items-center gap-2 rounded-xl border border-border px-1.5 pt-3.5 pb-2.5 text-center">
+                        <div className="w-[58px] h-[58px] rounded-[15px] bg-bg-elevated flex items-center justify-center">
+                          <AlertTriangle aria-hidden className="lucide-inline text-[var(--warn)]" />
+                        </div>
+                        <span className="text-[12px] font-semibold text-text-strong max-w-full truncate">{app.manifest?.displayName || app.name}</span>
+                        <span className="text-[10.5px] text-muted leading-tight">{i18nT('pages.appsPage.this_app_could_not_be_displayed')}</span>
+                        {/* The crashed tile removed the app's management surface, so the
+                            fallback must keep one recovery path: quiet a broken enabled
+                            app, or remove a disabled one entirely (locked apps cannot
+                            be uninstalled). Same handlers as the healthy tile. */}
                         {app.enabled ? (
                           <Btn
                             onClick={() => handleAction(app.name, 'disable')}
@@ -453,18 +459,37 @@ export default function LibraryPage() {
                           </Btn>
                         )}
                       </div>
-                    </div>
-                  }
-                >
-                  <InstalledAppCard
-                    app={app}
-                    actionLoading={updatingAll ? `${app.name}:update` : actionLoading}
-                    onAction={handleAction}
-                    onOpen={() => navigate(appNavTarget(app)?.route || `/apps/${app.name}`)}
-                    onDetail={() => openDetail(app.name)}
-                  />
-                </ErrorBoundary>
-              ))}
+                    }
+                  >
+                    <LaunchpadTile
+                      app={app}
+                      pinned={!!target && !navHidden.has(target.id)}
+                      pinnable={!!target}
+                      actionLoading={updatingAll
+                        ? `${app.name}:update`
+                        : updatePending ? `${updatePending}:update` : actionLoading}
+                      onTogglePin={togglePin}
+                      onAction={handleAction}
+                      onOpen={() => {
+                        // An `openCommand` app opens by RUNNING its command
+                        // never by
+                        // routing — `appNavTarget` is null for it, and the
+                        // `/apps/${name}` fallback would land on a detail page
+                        // pretending to be the app. Remote gateways answer
+                        // `{remote: true}` with the command to run locally.
+                        if (app.manifest?.openCommand) {
+                          api.openApp(app.name).then((res: { remote?: boolean; command?: string; message?: string } | null) => {
+                            if (res?.remote) setRemoteCmd(res.command || res.message || i18nT('components.appstore.installedAppCard.app_cannot_be_opened_kirocrew_is_running_in_a_he'))
+                          }).catch(() => {})
+                          return
+                        }
+                        navigate(target?.route || `/apps/${app.name}`)
+                      }}
+                      onDetail={() => openDetail(app.name)}
+                    />
+                  </ErrorBoundary>
+                )
+              })}
             </div>
           </>
         )}

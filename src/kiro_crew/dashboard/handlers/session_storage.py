@@ -850,8 +850,18 @@ def _classify(uids: list[str], index: SessionIndex, now: float) -> tuple[list[st
     guarantee is NOT weakened: it still re-reads the session map inside the lock
     and still refuses anything live, so this pre-pass can only ever be more
     conservative than the authority, never less.
+
+    That property requires the enumeration below to be UNCACHED — in both
+    halves. The co-tenant contribution to ``active`` is served from a 30s cache
+    on ordinary read paths, and a pre-pass fed a stale co-tenant set would
+    classify a just-claimed session as eligible — the authority would still
+    refuse it, but as the all-or-nothing batch failure this function exists to
+    prevent. The STORE half fails the same way on its own: ``age_days`` reads
+    the scan's mtime, so a session appended to after a cached pass reads
+    stale-older here and ``too_fresh`` inside the move. A perf change that
+    re-caches either half re-opens the batch failure.
     """
-    by_uid = {u.uid: u for u in list_units(index)}
+    by_uid = {u.uid: u for u in list_units(index, cached=False)}
     eligible: list[str] = []
     refused: list[dict] = []
     for uid in uids:
@@ -932,8 +942,42 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             refresh=_build_index,
         )
     except SessionStorageError as exc:
+        # Audited before returning. A refusal from inside the move is the same
+        # security-relevant outcome as the pre-flight one above -- someone asked to
+        # remove specific conversations and was told no -- and it is the ONLY record
+        # for the case where every selected session was protected, which returns
+        # here rather than through the success path. Resources names the selection
+        # rather than a per-uid reason: which one tripped it is in the message, and
+        # the whole batch was refused either way.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(eligible)[:512],
+        )
         return _refused(exc, "trash_refused")
 
+    # A session resumed while the batch was being staged was left in place, and
+    # this endpoint's contract is that anything not taken is named. It joins the
+    # same list under the same code the pre-flight uses for a live session: the
+    # mechanism differs (caught by mtime during the move, not by the index before
+    # it) but the fact the reader needs is identical — it is in use, so it stayed.
+    revived_refusals = [{"uid": uid, "reason": "in_use"} for uid in batch.revived]
+    if revived_refusals:
+        # Audited for the same reason the pre-flight refusal above is, and it has
+        # to be its own event: that one is emitted before the move, so a session
+        # protected DURING the move would otherwise appear in the record only
+        # inside a "success", leaving the protection itself unlogged. Emitted
+        # before the success event so the trail reads in the same order as the
+        # pre-flight path.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(f"{r['uid']}:{r['reason']}" for r in revived_refusals)[:512],
+        )
     _sel().log_api_access(
         caller=_read_session_key(request),
         operation="session_storage.trash",
@@ -946,6 +990,6 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             "sessions": batch.sessions,
             "bytes": batch.bytes,
             "batch_id": batch.batch_id,
-            "refused": refused,
+            "refused": refused + revived_refusals,
         }
     )

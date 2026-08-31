@@ -32,8 +32,10 @@ from kiro_crew.acp._dispatch import (
     build_permission_event,
     classify_notification,
     parse_metadata,
+    parse_prompt_token_usage,
     parse_session_update,
     parse_text_chunk,
+    parse_usage_cost,
     parse_usage_update,
     redact_text,
     reject_option_id,
@@ -41,12 +43,14 @@ from kiro_crew.acp._dispatch import (
     set_model_params,
 )
 from kiro_crew.acp.client import (
+    _COMPACTION_FAILED_TURN_BUDGET,
     AcpProcessDied,
     AcpTimeoutError,
     _effective_prompt_timeout_async,
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _raise_acp_error,
+    compaction_failure_detail,
     format_command_result,
     parse_slash_command,
     prompt_timeout_for_ceiling,
@@ -98,6 +102,7 @@ from kiro_crew.acp.types import (
     OUTCOME_CANCELLED,
     OUTCOME_SELECTED,
     STOP_REASON_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
     UPDATE_CURRENT_MODE,
@@ -105,7 +110,6 @@ from kiro_crew.acp.types import (
     AcpEvent,
     AcpPromptStats,
     JsonRpcMessage,
-    TurnUsage,
 )
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -363,6 +367,30 @@ _MCP_DRAIN_REPORT_ACTIONS = frozenset(
 _SENTINEL = object()
 
 
+def parse_advertised_models(resp: dict[str, Any]) -> list[dict[str, str]]:
+    """The normalized advertised-model list from a ``session/new``/``session/load``
+    response (``[]`` when the backend advertised nothing).
+
+    Accepts both response shapes: a ``models`` object
+    ``{availableModels: [...], currentModelId}`` and a bare list under either
+    key. A falsy ``models`` value (``{}``, ``[]``, ``None``) falls through to a
+    top-level ``availableModels`` — callers that gate on ``models`` themselves
+    should pass a wrapped envelope (e.g. ``{"models": models}``) so the
+    fallback cannot source the list from a payload their gate never saw. Normalization matches
+    :meth:`AcpSessionHandle._normalize_models`, so a
+    probe's answer and a session-init snapshot are directly comparable.
+    """
+    models = resp.get("models") or resp.get("availableModels")
+    if isinstance(models, dict):
+        avail = models.get("availableModels", [])
+        if isinstance(avail, list):
+            return AcpSessionHandle._normalize_models(avail)
+        return []
+    if isinstance(models, list):
+        return AcpSessionHandle._normalize_models(models)
+    return []
+
+
 class AcpRuntimeError(Exception):
     """Base error for AcpRuntime operations."""
 
@@ -413,6 +441,11 @@ class AcpRuntimeProtocol(Protocol):
         ...
 
     async def send_request(self, method: str, params: dict[str, Any]) -> int:
+        ...
+
+    async def probe_advertised_models(self) -> list[dict[str, str]]:
+        """Fresh advertised-model snapshot from a throwaway ``session/new``
+        (``[]`` = probe failed / advertised nothing — never evidence)."""
         ...
 
     async def send_notification(self, method: str, params: dict[str, Any]) -> None:
@@ -521,6 +554,10 @@ class AcpSessionHandle:
         # a yield in prompt().
         self._parked_total: float = 0.0
         self._parked_since: float | None = None
+        # Monotonic timestamp of a `failed` compaction status seen this turn
+        # (None otherwise). Arms the post-failure budget in _dispatch_events,
+        # which ends an abandoned turn instead of draining to the ceiling.
+        self._compaction_failed_at: float | None = None
         # Consumers that implement the low-fidelity child downgrade (dashboard
         # card / interactive approver) opt IN; for everyone else the handle
         # itself fail-closes low-fidelity child permission requests below, so
@@ -1656,7 +1693,20 @@ class AcpSessionHandle:
                 self._resolved_model_id = current_model_id
             avail = models.get("availableModels", [])
             if isinstance(avail, list):
-                self._available_models = self._normalize_models(avail)
+                # The shape walk is delegated to the canonical parser so this
+                # snapshot and a probe's answer stay directly comparable
+                # (#6382). The envelope is the same checked-binding discipline
+                # as the client's, though here the parser's dict-or-list
+                # fallback is unreachable by construction (the inner dict
+                # always has a key). The isinstance check above is the
+                # assignment gate: a non-list ``availableModels`` must not
+                # clobber a previously-stored list. A well-formed EMPTY list
+                # still overwrites — that asymmetry with
+                # ``AcpClient._capture_available_models`` (non-empty guard) is
+                # pre-existing policy, deliberately unchanged here.
+                self._available_models = parse_advertised_models(
+                    {"models": {"availableModels": avail}}
+                )
             # A backend may advertise its model list without echoing
             # ``currentModelId`` (it is best-effort in the ACP shape). When it
             # names exactly one model that IS the served model unambiguously, so
@@ -1669,13 +1719,18 @@ class AcpSessionHandle:
             if not self._resolved_model_id and len(self._available_models) == 1:
                 self._resolved_model_id = self._available_models[0]["modelId"]
         elif isinstance(models, list):
-            self._available_models = self._normalize_models(models)
+            self._available_models = parse_advertised_models({"availableModels": models})
 
     @staticmethod
     def _normalize_models(advertised: list[Any]) -> list[dict[str, str]]:
         """Normalize advertised models to ``{modelId, name, description}`` with
-        guaranteed keys (parity with AcpClient._capture_available_models), so the
-        dashboard model dropdown gets a stable shape regardless of backend."""
+        guaranteed keys — the canonical normalization. Every consumer
+        (``parse_advertised_models``, and through it ``store_session_config``,
+        ``AcpClient._capture_available_models``, and the pooled-runtime
+        entitlement probe ``AcpRuntime.probe_advertised_models``) shares this
+        shape, so probe answers and session-init snapshots are directly
+        comparable and the dashboard model dropdown gets a stable shape
+        regardless of backend."""
         captured: list[dict[str, str]] = []
         for m in advertised:
             if not isinstance(m, dict):
@@ -1689,6 +1744,28 @@ class AcpSessionHandle:
                 "description": str(m.get("description") or ""),
             })
         return captured
+
+    async def refresh_available_models(self) -> list[dict[str, str]]:
+        """Re-resolve the advertised-model snapshot against the live backend.
+
+        ``_available_models`` is otherwise written once, from this session's own
+        ``session/new`` — an answer the backend resolved from the account state
+        it held at that instant. When that answer was degraded (a lookup racing
+        a token refresh answers with the default tier), the session refuses
+        models the account actually has, for its whole life. Every consumer of
+        entitlement — the explicit-pick refusal, the prompt-time pin withhold,
+        the dashboard picker filter — reads through this handle's snapshot, so
+        one refresh heals them all.
+
+        The snapshot is replaced only by a NON-EMPTY probe result: a failed or
+        empty probe is not evidence about entitlement, so the prior snapshot is
+        kept. Returns the probe result either way, so callers can distinguish
+        "revalidated" from "could not revalidate".
+        """
+        fresh = await self._runtime.probe_advertised_models()
+        if fresh:
+            self._available_models = list(fresh)
+        return fresh
 
     def _sync_effort_levels(self) -> None:
         """Push ACP-reported effort levels to the global validation set (parity
@@ -1848,6 +1925,10 @@ class AcpSessionHandle:
         """
         deadline = time.monotonic() + timeout
         last_data_ts = time.monotonic()
+        # Cleared per turn: armed by the compaction branch below on a
+        # `failed` status, then read by the post-failure budget check at the
+        # loop top (mirrors AcpClient._prompt_loop).
+        self._compaction_failed_at = None
         # Whether a native agent-switch notification already reported the
         # switch this turn; guards the result-extracted fallback below from
         # double-emitting EVENT_AGENT_SWITCHED (mirrors AcpClient).
@@ -1856,6 +1937,20 @@ class AcpSessionHandle:
         # taken. The idle clocks below measure BACKEND silence, so any park that
         # happens after this point must be subtracted from them.
         parked_at_data = self._parked_total
+        # SESSION-ATTRIBUTABLE twin of (last_data_ts, parked_at_data), read by
+        # the post-compaction-failure budget AND the tool-idle watchdog. On a
+        # shared runtime, ownerless global notifications are fanned out to every
+        # co-tenant queue (msg.fanout_no_owner), so another session's steady
+        # traffic would keep resetting last_data_ts and defer both clocks on
+        # work this session never produced — for the budget, out to the
+        # multi-hour outer deadline that is the exact hang it exists to bound.
+        #
+        # The STALE clock deliberately keeps reading last_data_ts: it already
+        # folds in the runtime-wide _last_activity (bumped on every stdout
+        # line), so runtime-global traffic is inside its contract by
+        # construction and narrowing its queue term would change nothing.
+        last_own_data_ts = last_data_ts
+        parked_at_own_data = parked_at_data
 
         _buffered: list[JsonRpcMessage] = []
         try:
@@ -1863,6 +1958,46 @@ class AcpSessionHandle:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
+
+                # Post-compaction-failure budget: automatic compaction reported
+                # `failed` and the backend has since gone silent past the budget,
+                # so no prompt response or end_turn is coming. End the turn with
+                # an explicit stop reason so the caller releases the slot instead
+                # of draining to the chat-turn ceiling (issue #3583). Consumer
+                # park time is subtracted, like every other idle clock here, so a
+                # long human approval cannot be charged to the backend.
+                #
+                # SUSPENDED while a tool is in flight, for the same reason as
+                # AcpClient's twin: a silent long tool dispatched after the failed
+                # compaction is live work, and reaping it at 60s would cancel the
+                # session out from under it. The tool-stall watchdog below owns
+                # that case; this budget re-arms when the tool resolves.
+                #
+                # Clock asymmetry with AcpClient's twin is INTENTIONAL: the shared
+                # runtime fans ownerless frames out to every co-tenant, so this
+                # side keys off SESSION-ATTRIBUTABLE frames (last_own_data_ts)
+                # where the dedicated-process side can trust last_data_ts.
+                if self._compaction_failed_at is not None and not self._tool_dispatched:
+                    _compact_idle = max(
+                        0.0,
+                        (time.monotonic() - max(last_own_data_ts, self._compaction_failed_at))
+                        - max(0.0, self._parked_total - parked_at_own_data),
+                    )
+                    if _compact_idle > _COMPACTION_FAILED_TURN_BUDGET:
+                        logger.warning(
+                            "Compaction failed on session %s and no prompt response "
+                            "arrived for %.0fs — ending the turn.",
+                            self._session_id,
+                            _compact_idle,
+                        )
+                        self._compaction_failed_at = None
+                        self._turn_done.set()
+                        yield AcpEvent(
+                            kind=EVENT_COMPLETE,
+                            stop_reason=STOP_REASON_COMPACTION_FAILED,
+                            usage=self.last_prompt_stats.to_turn_usage(),
+                        )
+                        return
 
                 # Unresponsive-cancel recovery: cancel() was sent but kiro-cli has
                 # not acked (no cancelled stopReason) within the grace budget. On a
@@ -1894,7 +2029,7 @@ class AcpSessionHandle:
                             self._session_id, self._cancel_grace_secs,
                         )
                         yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_STALE_RECOVER,
-                                       usage=TurnUsage(credits=self.last_prompt_stats.credits))
+                                       usage=self.last_prompt_stats.to_turn_usage())
                         return
                     logger.warning(
                         "Cancel unacked after %.1fs on session %s — unblocking caller "
@@ -1902,7 +2037,7 @@ class AcpSessionHandle:
                         self._cancel_grace_secs, self._session_id,
                     )
                     yield AcpEvent(kind=EVENT_COMPLETE, stop_reason="error: cancel unacked",
-                                   usage=TurnUsage(credits=self.last_prompt_stats.credits))
+                                   usage=self.last_prompt_stats.to_turn_usage())
                     return
 
                 try:
@@ -1920,9 +2055,11 @@ class AcpSessionHandle:
                     # stderr: AcpRuntime's stderr drain only rings the
                     # _stderr_lines buffer, so a kiro-cli reasoning burst on
                     # stderr does not move this clock); the tool clock keys off
-                    # session-queue frames only (keepalive and progress frames
-                    # for the session reset last_data_ts, so a
-                    # legitimately-streaming tool keeps the watchdog satisfied).
+                    # this session's OWN queue frames only (keepalive and
+                    # progress frames for the session reset last_own_data_ts, so
+                    # a legitimately-streaming tool keeps the watchdog
+                    # satisfied, while a co-tenant's ownerless fanned-out frame
+                    # does not defer it).
                     if self._cancelled:
                         continue
                     wd = self._watchdog
@@ -1938,7 +2075,20 @@ class AcpSessionHandle:
                     _parked = max(0.0, self._parked_total - parked_at_data)
 
                     if self._tool_dispatched:
-                        _tool_idle = max(0.0, (now - last_data_ts) - _parked)
+                        # Session-attributable clock: an ownerless fanned-out
+                        # frame is at most one co-tenant's traffic and nothing
+                        # says whose, so it must not stand in for progress on
+                        # THIS session's in-flight tool.
+                        #
+                        # Its park correction is taken from the matching
+                        # baseline. Reusing `_parked` (measured from the newer
+                        # last_data_ts) would leave a park between the two
+                        # baselines unsubtracted, inflating idle and making this
+                        # branch QUICKER to cancel a live turn — the one
+                        # direction a clock change here must never take by
+                        # accident.
+                        _own_parked = max(0.0, self._parked_total - parked_at_own_data)
+                        _tool_idle = max(0.0, (now - last_own_data_ts) - _own_parked)
                         if _tool_idle <= wd.check_after_secs:
                             continue
                         # F2 — TOCTOU guard: two complementary signals cover
@@ -1966,7 +2116,19 @@ class AcpSessionHandle:
                             self._ingress_seq != _ingress_before
                             or self._queue.qsize() > _q_depth_before
                         ):
+                            # Both clocks advance. Neither signal can name the
+                            # arriving frame's owner (it has not been dequeued),
+                            # so this deliberately keeps the guard's existing
+                            # fail-safe over-count — the same trade _ingress_seq
+                            # already documents at its increment. A co-tenant
+                            # frame landing inside the oracle await therefore
+                            # still defers the tool clock, but by ONE tick: when
+                            # it is dequeued the ownership check below leaves
+                            # last_own_data_ts alone, so the unbounded deferral
+                            # this branch used to allow cannot re-form.
                             last_data_ts = time.monotonic()
+                            last_own_data_ts = last_data_ts
+                            parked_at_own_data = self._parked_total
                             continue
                         if verdict == VERDICT_WORKING:
                             self._log_working_deferral(_tool_idle, evidence, timeout)
@@ -2128,6 +2290,15 @@ class AcpSessionHandle:
 
                 last_data_ts = time.monotonic()
                 parked_at_data = self._parked_total
+                if not msg.fanout_no_owner:
+                    # Only a frame attributable to THIS session defers the
+                    # tool-idle watchdog and the post-compaction-failure budget
+                    # (see the twin's init note). Provenance is the
+                    # discriminator, not the frame's method: the same kind can
+                    # arrive routed (this session's own progress) or fanned out
+                    # (a co-tenant's), and only the runtime knows which.
+                    last_own_data_ts = last_data_ts
+                    parked_at_own_data = parked_at_data
                 self.last_prompt_stats.event_count += 1
 
                 # Turn-complete response
@@ -2145,6 +2316,7 @@ class AcpSessionHandle:
                     reason = ""
                     if isinstance(result, dict):
                         reason = result.get("stopReason", "") or ""
+                    self._track_prompt_usage(result)
                     if self._stale_probe and reason == STOP_REASON_CANCELLED:
                         # Probe-ack reclassification (the non-lethal harness for
                         # every watchdog probe): kiro-cli acks session/cancel on a
@@ -2192,7 +2364,7 @@ class AcpSessionHandle:
                     self._tool_dispatched = False
                     self._turn_done.set()
                     yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=reason,
-                                   usage=TurnUsage(credits=self.last_prompt_stats.credits))
+                                   usage=self.last_prompt_stats.to_turn_usage())
                     return
                 if msg.method is None and msg.id is not None:
                     # Response frame for a DIFFERENT req_id: a concurrent
@@ -2278,7 +2450,7 @@ class AcpSessionHandle:
                             self._tool_dispatched = False
                             self._turn_done.set()
                             yield AcpEvent(kind=EVENT_COMPLETE,
-                                           usage=TurnUsage(credits=self.last_prompt_stats.credits))
+                                           usage=self.last_prompt_stats.to_turn_usage())
                             return
                 elif action == "steer":
                     # Mid-turn steer lifecycle echo from kiro-cli (_session/steer).
@@ -2302,17 +2474,43 @@ class AcpSessionHandle:
                     params = msg.params or {}
                     status = params.get("status", {})
                     status_type = status.get("type", "") if isinstance(status, dict) else str(status)
-                    if status_type == "completed":
+                    # A compaction notification carrying no sessionId is fanned
+                    # out to EVERY co-tenant queue (AcpRuntime marks the copies
+                    # fanout_no_owner once more than one session is registered),
+                    # so at most one recipient actually compacted and nothing in
+                    # the frame says which.  Only a frame this session OWNS may
+                    # touch this session's per-turn state, in both directions:
+                    # an ownerless `failed` would arm the budget in every quiet
+                    # peer and reap its live turn (every consumer resets the
+                    # session on that terminal), and an ownerless `completed`
+                    # would disarm a peer's legitimate budget and restore the
+                    # #3583 hang this fix exists to close.  Same trust boundary
+                    # the budget's own clock already draws (last_own_data_ts) and
+                    # the subagent roster already draws (runtime_global=).  A lone
+                    # session's frame is left unmarked and genuinely is its own,
+                    # so single-session behaviour is unchanged.  The event still
+                    # surfaces either way — only the mutations are gated.
+                    owns_frame = not msg.fanout_no_owner
+                    if status_type == "completed" and owns_frame:
                         # The pre-compaction counts (and their authoritative
                         # context_tokens_from_usage flag) no longer describe
                         # the session — drop them so the context meter resets
                         # and the next telemetry can re-derive real numbers.
                         # Mirrors AcpClient._handle_compaction_status.
+                        self._compaction_failed_at = None
                         self.last_prompt_stats.reset_after_compaction()
                     # Compaction summary is backend-echoed text (LLM-influenced)
                     # that reaches the dashboard — redact exfil URLs/credentials
                     # before surfacing it (parity with other text surfaces).
                     summary = redact_text(str(params.get("summary", "") or ""))
+                    if status_type == "failed":
+                        if owns_frame:
+                            # Arm the bounded post-failure wait (the budget check
+                            # at the loop top) and carry the notification's own
+                            # reason so the notice stops collapsing to
+                            # "unknown error".
+                            self._compaction_failed_at = time.monotonic()
+                        summary = compaction_failure_detail(params)
                     yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
                 elif action == "clear":
                     yield AcpEvent(kind=EVENT_CLEAR_STATUS)
@@ -2406,7 +2604,7 @@ class AcpSessionHandle:
             # tell this apart from a normal turn end.
             self._turn_done.set()
             yield AcpEvent(kind=EVENT_COMPLETE, stop_reason="timeout",
-                           usage=TurnUsage(credits=self.last_prompt_stats.credits))
+                           usage=self.last_prompt_stats.to_turn_usage())
         finally:
             for _m in _buffered:
                 self._queue.put_nowait(_m)
@@ -2611,8 +2809,20 @@ class AcpSessionHandle:
             title=(tool.title if tool else ""),
             tool_input=(tool.command if tool else ""),
             text=f"verdict={verdict}; idle_secs={int(idle)}; {evidence}",
-            usage=TurnUsage(credits=self.last_prompt_stats.credits),
+            usage=self.last_prompt_stats.to_turn_usage(),
         )
+
+    def _track_prompt_usage(self, result: Any) -> None:
+        """Fold a PromptResponse's turn-scoped token counts into the stats.
+
+        Mirrors ``AcpClient._track_prompt_usage``: the claude-agent-acp adapter
+        reports per-turn token counts on the prompt response; kiro-cli's
+        response carries only ``stopReason``, so ``parse_prompt_token_usage``
+        returns None there and the stats are untouched (harness parity).
+        """
+        tokens = parse_prompt_token_usage(result)
+        if tokens is not None:
+            self.last_prompt_stats.apply_prompt_token_usage(*tokens)
 
     def _track_metadata(self, msg: JsonRpcMessage) -> None:
         """Capture per-turn context usage + kiro billing credits from _kiro.dev/metadata.
@@ -2917,14 +3127,25 @@ class AcpSessionHandle:
                 # them so the meter resets and fresh telemetry re-derives real
                 # numbers (parity with the kiro-cli compaction handler).
                 self.last_prompt_stats.reset_after_compaction()
+                self._compaction_failed_at = None
                 status_type = "completed"
             elif kind == kas_wire.KIND_SUMMARIZATION_FAILED:
                 status_type = "failed"
+                # KAS is the third producer of a failed compaction status and
+                # rides the SAME dispatch loop, so it gets the same bounded
+                # post-failure wait — a KAS turn abandoned after failed
+                # summarization must not drain to the ceiling either.
+                self._compaction_failed_at = time.monotonic()
             else:
                 status_type = "started"
             # conversationSummary is backend-echoed, LLM-influenced text that
             # reaches the dashboard — redact exfil URLs/credentials first.
             summary = redact_text(str(kiro.get(kas_wire.FIELD_CONVERSATION_SUMMARY, "") or ""))
+            if status_type == "failed":
+                # conversationSummary is empty on failure, so the notice would
+                # collapse to "unknown error" here too — carry KAS's own reason
+                # (redacted + bounded by the helper).
+                summary = compaction_failure_detail(kiro)
             return [AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)]
         if kind in kas_wire.STEERING_KINDS:
             # KAS mid-turn steer echo. kiro-cli sends these as `session/update`
@@ -3167,6 +3388,12 @@ class AcpSessionHandle:
                         self.last_prompt_stats.note_pct_reported()
                 except (TypeError, ValueError, ZeroDivisionError):
                     pass
+            # Session-cumulative billing cost (claude seam); kiro never sends
+            # the key so this is None on the kiro path. Delta'd per turn on
+            # the stats object (monotonic guard lives there).
+            cost = parse_usage_cost(update)
+            if cost is not None:
+                self.last_prompt_stats.apply_cost_cumulative(cost)
             return []
 
         # config_option_update: ACP pushes updated configOptions (e.g. after

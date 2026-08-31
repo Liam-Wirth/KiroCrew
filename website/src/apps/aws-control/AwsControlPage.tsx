@@ -18,10 +18,13 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Cloud, RefreshCw, ChevronRight, ChevronDown, Search } from 'lucide-react'
 import { PageHeader, Btn, EmptyState, ContentSkeleton, Input } from '../../components/ui'
 import AwsConsentGate from '../../components/AwsConsentGate'
+import { api, type AwsConsentStatus } from '../../api/client'
 import { i18nT } from '../../i18n/t'
 import { awsControlApi, AwsControlError } from './api'
 import ConsoleView, { ReconnectAction } from './ConsoleView'
+import DrivePage from './DrivePage'
 import type { AwsAccount, AccountHealth } from './types'
+import type { LiveDrive } from './DrivePage'
 
 /** Tailwind token for each health light, keyed as an `as const` map (literal-safe). */
 const HEALTH_DOT: Record<AccountHealth, string> = {
@@ -251,6 +254,7 @@ export default function AwsControlPage() {
   // resolves single-segment routes only. Selecting an account row opens it; the
   // breadcrumb inside ConsoleView clears the selection to return here.
   const [selected, setSelected] = useState<AwsAccount | null>(null)
+  const [drive, setDrive] = useState<LiveDrive | null>(null)
   const [query, setQuery] = useState('')
 
   const accountsQ = useQuery({
@@ -261,7 +265,6 @@ export default function AwsControlPage() {
   const refresh = () => accountsQ.refetch()
 
   const data = accountsQ.data
-  const totals = data?.totals
 
   // Client-side filter over name + id; harmless when few accounts.
   const filtered = useMemo(() => {
@@ -273,14 +276,65 @@ export default function AwsControlPage() {
     )
   }, [data, query])
 
+  // A grant is keyed on the SERVICE, so it outlives the account it was recorded
+  // for. The console only shows a receipt whose grant matches that console's own
+  // account, which means a grant matching NO registered account has no console
+  // to live on and `revokeAwsConsent` has no caller anywhere - money confirmed
+  // with no way to unconfirm it. Zero registered accounts is only one way to
+  // reach that; deregistering the account a grant was recorded for while others
+  // remain is another, so the condition is the general one rather than an empty
+  // list. This mounts nothing whenever some registered account owns the grant,
+  // which is the ordinary case.
+  const s3ConsentQ = useQuery<AwsConsentStatus>({
+    queryKey: ['awsConsent', 's3'],
+    queryFn: () => api.awsConsent('s3'),
+  })
+  const ceConsentQ = useQuery<AwsConsentStatus>({
+    queryKey: ['awsConsent', 'ce'],
+    queryFn: () => api.awsConsent('ce'),
+  })
+  const orphaned = (c: AwsConsentStatus | undefined) => {
+    const owner = c?.grant?.account
+    if (c?.granted !== true || !owner) return false
+    // Only once the LIST is known. An in-flight accounts query leaves `data`
+    // undefined, and treating that as "no account owns this grant" would flash
+    // a withdraw control onto the ordinary accounts page on every load where the
+    // consent read lands first - a destructive control offered by mistake, and
+    // the exact section this page was cleaned of.
+    if (!accountsQ.isSuccess) return false
+    return !(data?.accounts ?? []).some((a) => a.account === owner)
+  }
+  const s3Orphan = orphaned(s3ConsentQ.data)
+  const ceOrphan = orphaned(ceConsentQ.data)
+
+  /* Three levels of view state, not routes: `BuiltinAppRoute` resolves only a
+     single-segment route, so the accounts list, one account's console and that
+     account's drive are all this component's state. The drive level is held HERE
+     rather than inside the console so the console does not nest a second page
+     within itself - each level renders exactly one surface. */
+  if (selected && drive) {
+    return (
+      <DrivePage
+        account={selected}
+        drive={drive}
+        onBack={() => setDrive(null)}
+      />
+    )
+  }
+
   if (selected) {
-    return <ConsoleView account={selected} onBack={() => setSelected(null)} />
+    return (
+      <ConsoleView
+        account={selected}
+        onBack={() => setSelected(null)}
+        onOpenDrive={setDrive}
+      />
+    )
   }
 
   const header = (
     <PageHeader
       title={i18nT('apps.awsControl.page.title')}
-      subtitle={i18nT('apps.awsControl.page.subtitle')}
       actions={
         <Btn onClick={refresh} disabled={accountsQ.isFetching} data-testid="refresh">
           <RefreshCw size={13} className={accountsQ.isFetching ? 'animate-spin' : ''} />
@@ -313,23 +367,12 @@ export default function AwsControlPage() {
     <div className="flex h-full flex-col">
       {header}
       <div className="flex-1 overflow-y-auto px-4 pb-6 md:px-6">
-        {/* One quiet aggregate line + a client-side search, on the same row. The
-            line only carries counts we actually have — storage/cost are not
-            measured in P0, so they are simply absent, never a fake zero. */}
-        <div className="flex flex-wrap items-center justify-between gap-2" data-testid="accounts-aggregate">
-          <p className="text-[13px] text-muted" data-testid="aggregate-line">
-            {totals ? (
-              <>
-                {i18nT('apps.awsControl.page.aggregate_accounts', { count: totals.accounts })}
-                {' · '}
-                {i18nT('apps.awsControl.page.aggregate_keys', { count: totals.profiles })}
-                {' · '}
-                {i18nT('apps.awsControl.page.aggregate_healthy', { count: totals.profilesHealthy })}
-              </>
-            ) : (
-              '\u00A0'
-            )}
-          </p>
+        {/* Accounts and a client-side search over them. Nothing else lives on
+            this page: the aggregate counts line was removed because the list it
+            summarised is directly below it, and the paid-service consent gates
+            moved onto the account they actually bill (see ConsoleView), where
+            the connection they use is already on screen. */}
+        <div className="flex flex-wrap items-center justify-end gap-2" data-testid="accounts-aggregate">
           <div className="relative">
             <Search size={13} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted" aria-hidden="true" />
             <Input
@@ -394,38 +437,29 @@ export default function AwsControlPage() {
           </div>
         )}
 
-        {/* Paid services — each requires an explicit owner confirmation before the
-            first billable call (spec G1). The gates are their own durable-state
-            components; this page only mounts them under its intro.
+        {/* No paid-service section here. This page is the account list, and a
+            confirmation is not an account: both paid services (s3 behind the
+            drive, ce behind the cost figure) are reached from an account's
+            console, so both the ask and the receipt live there. The earlier
+            claim that this page was the only surface able to show a grant was
+            wrong - the console already mounted both gates on refusal.
 
-            Guarded on the same signal as the account list: when a search is
-            actively filtering every account out (data with accounts, but
-            filtered to nothing), the page already shows "No accounts match X",
-            so the section must NOT render two consent cards alongside that
-            no-match state — it would read as if those cards survived the search.
-            In every other state (no query, or a query that still matches) the
-            section stays visible, so a normal unfiltered page is unchanged. */}
-        {!(data && data.accounts.length > 0 && filtered.length === 0) && (
-          <section className="mt-8" data-testid="paid-services">
-            <h2 className="text-sm font-semibold text-text-strong">
-              {i18nT('apps.awsControl.page.paid_services_title')}
-            </h2>
-            <p className="mt-1 text-[13px] text-muted">
-              {i18nT('apps.awsControl.page.paid_services_intro')}
+            The one exception below is not a section but a rescue: a grant whose
+            recorded account is not registered here has no console to appear on,
+            so without this it could never be withdrawn. It renders only in that
+            state, so whenever an account owns the grant this page is accounts
+            and nothing else. */}
+        {(s3Orphan || ceOrphan) && (
+          <div className="mt-6 flex flex-col gap-3" data-testid="orphan-consent">
+            {/* This state needs its sentence more than any other surface here: the
+                card names an AWS account that matches nothing in the list above
+                it, and its only control is destructive. */}
+            <p className="text-[13px] text-text" data-testid="orphan-consent-note">
+              {i18nT('apps.awsControl.page.orphan_consent')}
             </p>
-            {/* Each gate is ACCOUNT-scoped (AwsConsentGate resolves the registry's
-                default connection internally), but the copy above reads page-wide.
-                Say plainly that a card covers only its named connection and point
-                elsewhere for other accounts, so the operator does not read a
-                one-account confirmation as covering all N accounts in the header. */}
-            <p className="mt-1 mb-3 text-[13px] text-muted" data-testid="paid-services-scope">
-              {i18nT('apps.awsControl.page.paid_services_scope')}
-            </p>
-            <div className="flex flex-col gap-3">
-              <AwsConsentGate service="s3" />
-              <AwsConsentGate service="ce" />
-            </div>
-          </section>
+            {s3Orphan && <AwsConsentGate service="s3" />}
+            {ceOrphan && <AwsConsentGate service="ce" />}
+          </div>
         )}
 
         <AddAccounts />

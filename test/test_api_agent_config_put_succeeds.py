@@ -24,7 +24,7 @@ def _owner_caller(monkeypatch):
     its own enumerate-the-invariant coverage in
     test_agents_endpoints_owner_auth.py."""
     monkeypatch.setattr(
-        "kiro_crew.dashboard.handlers.agents.is_owner_dashboard_request",
+        "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
 
@@ -371,7 +371,7 @@ async def test_agent_config_write_holds_the_mcp_transaction_lock(tmp_path):
             _recording_lock,
         ),
         patch(
-            "kiro_crew.apps.bridges._mcp_lock",
+            "kiro_crew.dashboard.handlers.agents._agent_file_lock",
             _recording_file_lock,
         ),
         patch(

@@ -24,16 +24,26 @@ function browseCards(page: Page) {
 }
 
 /**
- * An installed app in the Library. InstalledAppCard's root is a bare div with no
- * testid or aria-label, but it renders the app name as a real <button> wired to
- * onDetail -- so role-scope it rather than matching loose text.
- *
- * Scoped to the #main-content landmark: an installed builtin also appears in
- * the nav rail, so an unscoped role+name lookup resolves to 2 elements. This
- * mirrors the convention capabilities.spec.ts already uses.
+ * An installed app in the Library launchpad grid. Each app renders as a
+ * LaunchpadTile whose root carries `data-testid="launchpad-tile-<name>"`
+ * (the app NAME, e.g. "projects" -- not the display name). Anchoring on the
+ * testid also keeps the lookup unambiguous: the tile's pin badge and
+ * overflow trigger are buttons whose accessible names CONTAIN the display
+ * name ("Pin Task Runner to the sidebar", "More actions for Task Runner"),
+ * and an installed builtin also appears in the nav rail.
  */
-function libraryCard(page: Page, displayName: string) {
-  return page.locator('#main-content').getByRole('button', { name: displayName, exact: true })
+function launchpadTile(page: Page, appName: string) {
+  return page.getByTestId(`launchpad-tile-${appName}`)
+}
+
+/**
+ * The tile face -- a real <button> (aria-label = display name, exact) that
+ * opens the app or its detail page. Asserting on it pins both that the tile
+ * exists AND that it wears the right accessible name, the same contract the
+ * old InstalledAppCard name-button assertion carried.
+ */
+function tileFace(page: Page, appName: string, displayName: string) {
+  return launchpadTile(page, appName).getByRole('button', { name: displayName, exact: true })
 }
 
 async function gotoDiscover(page: Page) {
@@ -107,21 +117,23 @@ test.describe('Discover Page — /apps', () => {
 })
 
 test.describe('Library Page — /apps/library', () => {
-  test('lists the installed Task Runner app', async ({ page }) => {
+  test('lists the installed Task Runner app as a launchpad tile', async ({ page }) => {
     await gotoLibrary(page)
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 10000 })
+    await expect(launchpadTile(page, 'projects')).toBeVisible({ timeout: 10000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible()
   })
 
   test('search narrows to matching installed apps', async ({ page }) => {
     await gotoLibrary(page)
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 10000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible({ timeout: 10000 })
 
     const search = page.getByRole('textbox', { name: 'Search library' })
     await search.fill('zzz_no_match_xyz')
     await expect(page.getByTestId('empty-state-title')).toHaveText('No matching apps', { timeout: 5000 })
+    await expect(launchpadTile(page, 'projects')).toHaveCount(0)
 
     await search.clear()
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 5000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible({ timeout: 5000 })
   })
 
   test('page round-trip: Library and Discover are independently routable', async ({ page }) => {
@@ -129,7 +141,7 @@ test.describe('Library Page — /apps/library', () => {
     await expect(page.getByRole('heading', { name: 'All apps' })).toBeVisible({ timeout: 5000 })
 
     await gotoLibrary(page)
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 10000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible({ timeout: 10000 })
     await expect(page.getByRole('heading', { name: 'All apps' })).toHaveCount(0)
 
     await gotoDiscover(page)
@@ -198,5 +210,56 @@ test.describe('App Page — /apps/:name', () => {
     // server-side half is the reserved-name refusal (reserved_app_name).
     await gotoLibrary(page)
     await expect(page.locator('text=is not installed')).toHaveCount(0)
+  })
+})
+
+test.describe('Discover Updates sub-tab — /apps/-/updates', () => {
+  // TODO(PR2+): the POPULATED updates list (UpdatesList rows, per-row Update,
+  // Update All progress) is NOT covered here. The e2e gateway boots a fresh
+  // data home where every builtin is installed at its bundled version — equal
+  // to its registry version — so `updateAvailable` is false on every row and
+  // `updatables` is always empty. Covering the populated state needs either a
+  // gateway seed knob (install an app at an older version than the registry
+  // advertises) or /api/apps/registry route interception; neither exists in
+  // this harness and building one is out of scope for PR2. The populated list
+  // and update flows are covered by vitest (useAppUpdates.test.tsx and the
+  // DiscoverPage/UpdatesList suites) instead.
+
+  test('deep-link renders the Updates tab active with the all-current empty state', async ({ page }) => {
+    await page.goto('/apps/-/updates', { waitUntil: 'domcontentloaded' })
+
+    // The route must resolve to DiscoverPage, not fall through to the
+    // /apps/:name AppHost not-found ("is not installed").
+    await expect(page.locator('text=is not installed')).toHaveCount(0)
+
+    // `exact: true` doubles as the hidden-at-zero badge pin: with zero
+    // updatables UnderlineTabs renders no count, so the accessible name is
+    // exactly "Updates" — a leaked "Updates 0" badge would fail this locator.
+    const updatesTab = page.getByRole('tab', { name: 'Updates', exact: true })
+    await expect(updatesTab).toBeVisible({ timeout: 10000 })
+    await expect(updatesTab).toHaveAttribute('aria-selected', 'true')
+
+    // Pinned to the stub gateway's known state (zero updatables — see the
+    // TODO above). If a future harness change seeds an updatable app, this
+    // assertion fails loudly: extend coverage to the populated list then.
+    await expect(page.getByTestId('empty-state-title')).toHaveText('Everything is up to date.', { timeout: 10000 })
+  })
+
+  test('sub-tab switching syncs the URL both ways', async ({ page }) => {
+    await gotoDiscover(page)
+
+    await page.getByRole('tab', { name: 'Updates', exact: true }).click()
+    await page.waitForURL('**/apps/-/updates', { timeout: 10000 })
+    await expect(page.getByTestId('empty-state-title')).toHaveText('Everything is up to date.', { timeout: 10000 })
+    // Switching the sub-tab swaps the content region: the Featured catalog
+    // heading must be unmounted, not merely below the fold.
+    await expect(page.getByRole('heading', { name: 'All apps' })).toHaveCount(0)
+
+    // The empty state's action returns to Featured and normalizes the URL
+    // back to the bare /apps mount.
+    await page.getByRole('button', { name: 'Browse Featured apps' }).click()
+    await page.waitForURL(/\/apps$/, { timeout: 10000 })
+    await expect(page.getByRole('heading', { name: 'All apps' })).toBeVisible({ timeout: 10000 })
+    await expect(page.getByRole('tab', { name: 'Featured', exact: true })).toHaveAttribute('aria-selected', 'true')
   })
 })

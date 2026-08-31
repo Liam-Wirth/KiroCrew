@@ -66,6 +66,7 @@ from kiro_crew.platform.update_layout import release_channel as _release_channel
 from kiro_crew.platform.update_layout import set_release_channel, wheel_update_command
 from kiro_crew.platform.update_provider import CommandProvider, resolve_provider
 from kiro_crew.platform_compat import reexec_python_module
+from kiro_crew.safety_override import flush_breadcrumb_writes
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,16 @@ _update_info: dict[str, object] = {
     "error_code": None,
     "unavailable_reason": None,
     "remediation": None,
+    #: Can THIS install take the in-app arm+approve path? True only for the
+    #: cli.sh managed venv — the one shape whose shadow updater the gateway
+    #: can run on itself. Carried on the wire so the SPA never renders an Arm
+    #: button that the arm endpoint would 409.
+    "can_arm": False,
+    #: Is the RUNNING build ahead of what the FOLLOWED channel publishes? See
+    #: :func:`_channel_move_pending`. Set only by a successful feed check, so a
+    #: feedless layout (git checkout, desktop bundle, container) and every
+    #: unchecked or failed check leave it False.
+    "channel_move_pending": False,
 }
 #: Bumped whenever the thing a check is computed AGAINST changes (today: a channel
 #: switch). A check already talking to the OLD channel's feed cannot be cancelled,
@@ -198,15 +209,54 @@ def _display_version(version: str, channel: str) -> str:
     event loop. DISPLAY ONLY -- every version COMPARISON (``_is_newer``,
     ``update_required``, the feed check) still uses the raw ``__version__``, so
     folding here can never make a client miscompare or loop on updates.
+
+    Correct for a version the followed channel actually PUBLISHES, which is what
+    every caller passes for a REMOTE version. For the RUNNING build, go through
+    :func:`_display_local_version`, which additionally refuses to fold bytes the
+    stable lane has never shipped -- see ``channel_move_pending``.
     """
     return base_version(version) if channel == "stable" else version
+
+
+def _channel_move_pending() -> bool:
+    """Is the RUNNING build ahead of what the followed channel publishes?
+
+    True means the followed lane has never shipped these bytes, so this install
+    is not ON that lane no matter what its ``channel`` file says: flipping the
+    switcher to stable while running an insider build (``0.5.0rc3`` against a
+    stable feed at ``0.4.1rc1``) is exactly this state, and it is only left by
+    re-running the installer for the chosen channel.
+
+    Derived from the FEED's own answer rather than from the version string's
+    prerelease stamp, and that is the whole point. Promotion never re-stamps, so
+    the stable lane's current release IS ``0.4.1rc1`` -- a stamp-based rule
+    ("insider-looking bytes mean an insider install") therefore misreads the
+    entire promoted-stable population as mid-switch, which is the false positive
+    this predicate replaces. A stable install merely running BEHIND (``0.4.0rc14``
+    against a feed at ``0.4.1rc1``) is not newer, so it is not a move: it is an
+    ordinary available update, and ``update_available`` already says so.
+
+    False whenever no feed answer exists -- an unchecked, failed, or feedless
+    layout (a git checkout, a desktop bundle, a container) must never be told it
+    is mid-switch on the strength of a comparison that never happened.
+    """
+    return bool(_update_info.get("channel_move_pending"))
 
 
 def _display_local_version() -> str:
     """``_local_version`` folded for display, keyed on the off-loop channel that
     a prior ``_do_update_check`` resolved into ``_update_info`` -- a plain dict
     read, so this stays off the event loop.
+
+    A pending channel move SUPPRESSES the fold. The fold's premise is that a
+    prerelease-looking stamp on a stable install is a promoted candidate, so the
+    clean base is the honest label; that premise fails for a build the stable
+    lane never published. Folding there renamed a running ``0.5.0rc3`` insider
+    build to ``0.5.0`` the moment the switcher was flipped to stable -- claiming
+    a stable release that does not exist, next to an "up to date" badge.
     """
+    if _channel_move_pending():
+        return _local_version
     return _display_version(_local_version, str(_update_info.get("channel") or ""))
 
 
@@ -219,17 +269,17 @@ def _feed_requires_update() -> bool:
     an update it cannot prove is needed.
 
     The local version is folded per channel before the comparison (the same
-    rule as ``_display_version``): a promoted STABLE build keeps its soaked
-    candidate's prerelease stamp (``0.3.0rc13`` IS the ``0.3.0`` release), so
-    comparing the raw stamp against a bare floor of ``0.3.0`` would force an
-    update onto the very build the floor names. On insider/nightly the stamp
-    is a real prerelease and stays significant.
+    rule as ``_display_local_version``, delegated to it so the two cannot
+    drift): a promoted STABLE build keeps its soaked candidate's prerelease
+    stamp (``0.3.0rc13`` IS the ``0.3.0`` release), so comparing the raw stamp
+    against a bare floor of ``0.3.0`` would force an update onto the very build
+    the floor names. On insider/nightly the stamp is a real prerelease and stays
+    significant.
     """
     floor = _update_info.get("feed_min_version")
     if not isinstance(floor, str) or not floor:
         return False
-    local = _display_version(_local_version, str(_update_info.get("channel") or ""))
-    return _is_newer(floor, local) is True
+    return _is_newer(floor, _display_local_version()) is True
 
 
 def _effective_update_required() -> bool:
@@ -284,8 +334,32 @@ def status_update_fields() -> dict[str, object]:
         # endpoint (which runs a full check per request). Empty until a check
         # has found a newer build. The changelog text stays OFF this hot-path
         # subset — consumers fetch it on demand.
+        #
+        # RAW, never folded: this is the same string ``InAppUpdateFlow``,
+        # ``api_update_arm``, and the snooze/skip persisted-record key key on —
+        # the shadow-venv apply step compares it byte-for-byte against the
+        # installed ``kiro_crew.__version__``, which is never folded either
+        # (promotion never re-stamps the bytes). For a display-only clean
+        # version, use ``update_latest_version_display`` below (or the
+        # ``/api/update/check`` endpoint's ``latest_version_display``).
         "update_latest_version": str(_update_info.get("latest_version") or ""),
+        # DISPLAY-ONLY fold of the candidate above (clean base on the stable
+        # channel), consumed by the proactive update popup's "vX is available"
+        # text. The popup's per-version snooze/skip records and every arm
+        # path keep keying on the RAW `update_latest_version`.
+        "update_latest_version_display": _display_version(
+            str(_update_info.get("latest_version") or ""),
+            str(_update_info.get("channel") or ""),
+        ),
         "update_channel": str(_update_info.get("channel") or ""),
+        # Is the running build ahead of everything the FOLLOWED channel
+        # publishes? The panel keys its "you must re-run the installer to move
+        # onto this lane" copy on this rather than on a comparison of
+        # ``update_channel`` against the version-derived ``release_channel``:
+        # promotion never re-stamps, so every promoted-stable install looks
+        # insider-stamped and read as permanently mid-switch. See
+        # ``_channel_move_pending``.
+        "update_channel_move_pending": _channel_move_pending(),
         # The panel needs WHO manages the update to speak honestly: a
         # command-managed host must not render the self-managed installer
         # instructions its policy exists to bypass.
@@ -306,6 +380,21 @@ def status_update_fields() -> dict[str, object]:
         # in-memory (boot-frozen governance + the cached check result).
         "update_required": _effective_update_required(),
         "update_min_version": _effective_min_version(),
+        # Whether the in-app arm+approve path applies to this install. The SPA
+        # gates its Update button on this, never on managed_by alone — that
+        # value also covers bare source installs whose arm would 409.
+        "update_can_arm": bool(_update_info.get("can_arm")),
+        # The RUNNING build's version folded for display (clean base on the
+        # stable channel), so the About page's version chip can show `0.4.0`
+        # instead of the promoted candidate's baked-in `0.4.0rc14` stamp.
+        # DISPLAY-ONLY sibling of the raw `version` the WS frame and
+        # /api/status carry: that one is functional — the SPA compares it
+        # across pushes to force a reload over a gateway upgrade, and folding
+        # it would collapse e.g. `0.4.1rc1` -> `0.4.1` and `0.4.1rc2` ->
+        # `0.4.1`, masking the very upgrade the reload detection exists to
+        # catch. Falls back to the raw version until a check has resolved the
+        # channel (`_display_local_version` keys on it; only stable folds).
+        "version_display": _display_local_version(),
     }
 
 
@@ -322,6 +411,16 @@ async def api_update_check(request: web.Request) -> web.Response:
         {
             **_update_info,
             "current_version": _display_local_version(),
+            # DISPLAY-ONLY sibling of the raw `latest_version` above (unpacked
+            # via `**_update_info`) — folds a promoted stable candidate's
+            # insider/rc stamp to the clean release it means. `latest_version`
+            # itself MUST stay raw: it is what `InAppUpdateFlow` and
+            # `api_update_arm` arm against, compared byte-for-byte against the
+            # installed build's own never-folded `__version__`.
+            "latest_version_display": _display_version(
+                str(_update_info.get("latest_version") or ""),
+                str(_update_info.get("channel") or ""),
+            ),
             "auto_update": cfg.auto_update,
             # Surface the pin so the dashboard can say WHY an update is mandatory
             # rather than showing a bare button. ``minimum_version_enforced``
@@ -481,6 +580,8 @@ def _set_update_info(**fields: object) -> None:
             "error_code": None,
             "unavailable_reason": None,
             "remediation": None,
+            "can_arm": False,
+            "channel_move_pending": False,
         }
     )
     _update_info.update(fields)
@@ -942,9 +1043,18 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
     # offered alongside it are read at different moments, and a switch landing in
     # between would otherwise publish one lane's name next to a command that moves
     # the install to the other.
+    #
+    # `can_arm` is probed here, with the verdict, rather than derived by the SPA:
+    # `managed_by == "kirocrew"` also covers bare source installs the arm
+    # endpoint refuses, so shipping the wider signal would render a dead button.
+    # Offloaded — the probe resolves venv paths on disk.
+    from kiro_crew.platform.wheel_engine import running_from_managed_venv
+
+    can_arm = await asyncio.to_thread(running_from_managed_venv)
     base: dict[str, object] = {
         **_capability_fields(capability.for_channel(channel)),
         "channel": channel,
+        "can_arm": can_arm,
     }
     url = f"{feed_base}/feed/{channel}/latest-cli.json"
 
@@ -1052,6 +1162,12 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
         # the two agree by construction. Reported anyway so the field means the
         # same thing on every layout and no consumer has to special-case one.
         version_newer=available,
+        # The other direction of the same comparison, and the only place it can
+        # honestly be computed: the running build is ahead of everything this
+        # lane publishes, so the lane never shipped it. Written from the same
+        # response as the verdict so a consumer can never pair one channel's
+        # move state with another channel's version.
+        channel_move_pending=_is_newer(_local_version, remote_version) is True,
         check_status=CHECK_SUCCEEDED,
         **extra,
     )
@@ -1285,7 +1401,19 @@ async def _restart_gateway(state: DashboardState) -> bool:
     state._gateway_restart_in_progress = True
     try:
         state.push_update_progress("restarting", "Restarting server…")
-        exe = sys.executable
+        # Resolved through the managed-venv stable link rather than taken from
+        # ``sys.executable``: after a shadow-venv promotion the cached path
+        # names the superseded versioned tree, and exec'ing it would restart
+        # the OLD version right after the update reported success. For every
+        # other install shape the resolver answers ``sys.executable``.
+        # Offloaded: the resolver walks the venv's sibling directory, which is
+        # synchronous filesystem I/O this loop must not wait on.
+        # Imported here, not at module scope: this module loads on the gateway
+        # boot path, and the updater subsystems are needed only when an
+        # update/restart actually runs (no-new-work-on-gateway-boot-path).
+        from kiro_crew.platform.wheel_engine import respawn_executable
+
+        exe = await asyncio.to_thread(respawn_executable)
         if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
             state.push_update_progress("error", "Cannot restart: invalid Python executable path")
             return False
@@ -1315,8 +1443,18 @@ async def _restart_gateway(state: DashboardState) -> bool:
             logger.debug("Session cleanup before restart failed", exc_info=True)
         sys.stdout.flush()
         sys.stderr.flush()
+        # The safety-override record publishes on a worker thread (its callers sit
+        # on the event loop), and os.execv replaces this process image without
+        # draining that worker -- so a grant activated moments before a restart
+        # would lose the very notice this restart is what makes necessary (found
+        # in review). Offloaded so a stalled write cannot block the loop, and
+        # bounded, so a restart is never held up by it.
+        try:
+            await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
+        except Exception:
+            logger.debug("Breadcrumb flush before restart failed", exc_info=True)
         await asyncio.sleep(0.5)
-        reexec_python_module("kiro_crew", sys.argv[1:])
+        reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
         return True
     finally:
         state._gateway_restart_in_progress = False
@@ -1988,7 +2126,6 @@ async def api_update_channel(request: web.Request) -> web.Response:
     # Same reason as the write above: a config read is disk I/O on a path the
     # operator may have put on a network mount.
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    _, artifact_base = _cdn_bases()
     return web.json_response(
         {
             "ok": True,
@@ -2006,6 +2143,13 @@ async def api_update_channel(request: web.Request) -> web.Response:
             # name (same helper, same https pin as the check's own path).
             "channel": stored,
             "update_command": wheel_update_command(stored),
+            # Same display-only sibling as api_update_check: this response IS
+            # the re-run check the panel adopts wholesale, so it must carry the
+            # folded version too or a channel switch would blank the clean
+            # display back to the raw stamp.
+            "latest_version_display": _display_version(
+                str(_update_info.get("latest_version") or ""), stored
+            ),
         }
     )
 
@@ -2058,3 +2202,259 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
 
     task.add_done_callback(_restart_done)
     return web.json_response({"ok": True, "status": "restarting"})
+
+
+# ── In-app wheel update: arm + host-local approve (RFC OQ7) ──
+
+
+def _loopback_peer(request: web.Request) -> bool:
+    """Did this request arrive from the host? Defence in depth, not authority.
+
+    The NONCE is the authority — it proves the caller read the gateway host's
+    filesystem. This check just refuses the obviously-remote shape early, and
+    is knowingly imperfect behind same-host proxies (issue #1762), which is
+    exactly why it is not the boundary.
+
+    Composed from the SHARED predicates rather than a bespoke IP list: an
+    AF_UNIX caller has an EMPTY ``request.remote`` (token_auth documents
+    this), so an IP-only test would 403 the CLI's PREFERRED transport — the
+    unix socket, whose SO_PEERCRED check is stronger host-locality evidence
+    than any IP. The auth middleware's ``internal_auth`` / ``peer_verified``
+    marks are honoured too, so a local-secret-authenticated caller passes
+    however it connected.
+    """
+    if request.get("internal_auth") or request.get("peer_verified"):
+        return True
+    from kiro_crew.dashboard.origin import request_is_unix_socket
+    from kiro_crew.dashboard.urls import is_loopback
+
+    if request_is_unix_socket(request):
+        return True
+    return is_loopback(request.remote or "")
+
+
+async def api_update_arm(request: web.Request) -> web.Response:
+    """POST /api/update/arm — arm a pending in-app update (SPA-callable).
+
+    Arming grants nothing: it records the request and writes the approval
+    nonce to a file only the host can read. The response NEVER carries the
+    nonce. Refused for every shape except the managed venv, and refused when
+    no update-available verdict is cached — an arm must name the version the
+    check reported, not whatever the feed happens to serve later (the apply
+    re-verifies against the signed manifest anyway).
+    """
+    # Function-local: boot-path rule, same as _restart_gateway's import.
+    from kiro_crew.platform import update_stepup
+    from kiro_crew.platform.wheel_engine import running_from_managed_venv
+
+    if not await asyncio.to_thread(running_from_managed_venv):
+        return web.json_response(
+            {
+                "error": "in-app update applies only to the cli.sh managed-venv install",
+                "code": "arm_wrong_shape",
+            },
+            status=409,
+        )
+    if resolve_provider() is not None:
+        return web.json_response(
+            {
+                "error": "updates on this host are managed by policy",
+                "code": "arm_policy_managed",
+            },
+            status=409,
+        )
+    available = _update_info.get("update_available")
+    version = str(_update_info.get("latest_version") or "")
+    channel = str(_update_info.get("channel") or "")
+    if available is not True or not version:
+        return web.json_response(
+            {
+                "error": "no update-available verdict — run a check first",
+                "code": "arm_no_verdict",
+            },
+            status=409,
+        )
+    try:
+        pending = await asyncio.to_thread(update_stepup.arm, version, channel, source="dashboard")
+    except update_stepup.StepUpError as exc:
+        return web.json_response({"error": str(exc), "code": "arm_failed"}, status=500)
+    return web.json_response({"ok": True, **update_stepup.public_view(pending)})
+
+
+async def api_update_arm_status(request: web.Request) -> web.Response:
+    """GET /api/update/arm — the armed request, SPA-safe projection."""
+    from kiro_crew.platform import update_stepup
+
+    pending = await asyncio.to_thread(update_stepup.read_pending)
+    if pending is None:
+        return web.json_response({"armed": False})
+    return web.json_response(update_stepup.public_view(pending))
+
+
+async def api_update_approve(request: web.Request) -> web.Response:
+    """POST /api/update/approve — consume the nonce and run the shadow apply.
+
+    Called by ``kirocrew update approve`` on the gateway host, which read the
+    nonce from the data home. On success the apply runs as a background task:
+    shadow build + verify + promote (all off-loop), then the shared gateway
+    restart, with progress on the same SSE feed the git apply uses.
+    """
+    if not _loopback_peer(request):
+        return web.json_response(
+            {
+                "error": "approval is accepted from the gateway host only",
+                "code": "approve_not_local",
+            },
+            status=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict) or not isinstance(body.get("nonce"), str):
+        return web.json_response(
+            {"error": "nonce must be a string", "code": "invalid_nonce"}, status=400
+        )
+    # Function-local: boot-path rule, same as the other update handlers.
+    from kiro_crew.platform import update_stepup
+    from kiro_crew.platform.update_layout import cdn_bases as _cdn
+    from kiro_crew.platform.update_layout import cdn_bases_are_safe as _cdn_safe
+    from kiro_crew.platform.wheel_engine import WheelUpdateError, apply_wheel_update
+
+    # A policy-defined command provider OWNS updates on this host, and its
+    # commands never read the built-in mechanism this endpoint drives. Checked
+    # at APPROVE time, not just at arm: a provider installed in the window
+    # between the two must win — the armed request predates the policy, and a
+    # host approval is not authority to bypass it.
+    if resolve_provider() is not None:
+        return web.json_response(
+            {
+                "error": "updates on this host are managed by policy",
+                "code": "approve_policy_managed",
+                "governance": True,
+            },
+            status=409,
+        )
+    # Source pin BEFORE the nonce is consumed: a pinned fleet's policy decides
+    # where this host may take code from, and a host approval is not that
+    # authority (same seam the git apply and the CLI wheel path enforce).
+    # Checked pre-consume so a policy-refused attempt leaves the armed request
+    # intact rather than burning it on a request that could never proceed.
+    feed_base, artifact_base = _cdn()
+    blocked = update_blocked_reason(feed_base) or update_blocked_reason(artifact_base)
+    if blocked:
+        logger.warning("In-app update approval refused by source pin: %s", blocked)
+        return web.json_response(
+            {"error": blocked, "code": "approve_blocked_by_policy", "governance": True},
+            status=403,
+        )
+    if not _cdn_safe():
+        return web.json_response(
+            {"error": "CDN base URL contains disallowed characters", "code": "approve_bad_cdn"},
+            status=409,
+        )
+    # SEL-audited at every verdict: an approval is a code-install
+    # authorization, which is exactly the class of event the audit chain
+    # exists to reconstruct. `caller` is the transport identity — the nonce
+    # proves host-locality, not a person.
+    from kiro_crew.sel import sel as _sel
+
+    def _audit_sync(
+        outcome: str, error: str = "", resources: str = "", required: bool = False
+    ) -> None:
+        try:
+            _sel().log_api_access(
+                caller="host-cli" if request.get("internal_auth") else (request.remote or "unix"),
+                operation="update.approve",
+                outcome=outcome,
+                source="dashboard",
+                resources=resources,
+                error=error,
+                critical=True,
+            )
+        except Exception:
+            # A GRANTED verdict is a code-install authorization: if its audit
+            # record cannot be written, the install must not proceed — an
+            # unwritable SEL would otherwise let approvals happen unaudited
+            # (fail-open on the exact event the audit chain exists for).
+            # Denials stay best-effort: a failed denial audit still refuses.
+            if required:
+                raise
+            logger.debug("SEL audit for update.approve failed", exc_info=True)
+
+    async def _audit(
+        outcome: str, error: str = "", resources: str = "", required: bool = False
+    ) -> None:
+        # Offloaded: a CRITICAL SEL write flushes inline on the calling thread
+        # by design (fail-closed audit), and this handler's thread is the
+        # event loop (no-blocking-call-on-event-loop).
+        await asyncio.to_thread(_audit_sync, outcome, error, resources, required)
+
+    try:
+        pending = await asyncio.to_thread(update_stepup.consume, body["nonce"])
+    except update_stepup.StepUpError as exc:
+        await _audit("denied", error=str(exc))
+        return web.json_response({"error": str(exc), "code": "approve_refused"}, status=403)
+    try:
+        await _audit("granted", resources=f"v{pending.version} ({pending.channel})", required=True)
+    except Exception:
+        # The armed request is already consumed (single-use), so refusing here
+        # costs the operator a re-arm — the fail-closed direction: no code
+        # install proceeds without its audit record.
+        logger.error(
+            "update.approve audit could not be written; refusing unaudited install",
+            exc_info=True,
+        )
+        return web.json_response(
+            {
+                "error": "approval audit could not be recorded; the update was not started",
+                "code": "approve_audit_failed",
+            },
+            status=503,
+        )
+
+    state: DashboardState = request.app["state"]
+    loop = asyncio.get_running_loop()
+
+    def _progress(msg: str) -> None:
+        # Called from the executor thread; push on the serving loop.
+        loop.call_soon_threadsafe(state.push_update_progress, "building", msg)
+
+    async def _apply() -> None:
+        state.push_refresh("updating")
+        state.push_update_progress("pulling", f"Applying update to v{pending.version}…")
+        try:
+            await asyncio.to_thread(
+                apply_wheel_update,
+                channel=pending.channel,
+                feed_base=feed_base,
+                artifact_base=artifact_base,
+                expected_version=pending.version,
+                progress=_progress,
+            )
+        except WheelUpdateError as exc:
+            # Redacted BEFORE the log line as well as the progress push: the
+            # message can embed the CDN base (an operator override may carry
+            # basic-auth credentials in the URL), and the kiro_crew logger
+            # feeds the ring buffer that /api/logs streams to the dashboard —
+            # a raw log line is the same exposure as a raw progress push.
+            message, _ = redact_credentials(str(exc))
+            message, _ = redact_exfiltration_urls(message)
+            logger.warning("In-app wheel update failed: %s", message)
+            await _audit("failed", error=message, resources=f"v{pending.version}")
+            state.push_update_progress("failed", message)
+            state.push_refresh("update_failed")
+            return
+        except Exception:
+            logger.exception("In-app wheel update failed unexpectedly")
+            state.push_update_progress("failed", "Update failed — check logs")
+            state.push_refresh("update_failed")
+            return
+        logger.info("In-app wheel update to v%s promoted; restarting", pending.version)
+        await _audit("success", resources=f"v{pending.version} promoted")
+        await _restart_gateway(state)
+
+    task = asyncio.create_task(_apply())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+    return web.json_response({"ok": True, "status": "applying", "version": pending.version})

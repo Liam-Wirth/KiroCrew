@@ -16,7 +16,9 @@ import contextlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -260,6 +262,216 @@ class TestMoveTakesBothHalves:
         assert str(crew_home / "sessions" / "dashboard_chat-1.jsonl") in origins
 
 
+class TestASessionResumedWhileStagingIsLeftAlone:
+    """The authority checks run before the move loop, so they describe one instant.
+
+    A batch is not instant, and a session can be resumed between being certified
+    retired and being reached by the loop. The loop catches that from the stat it
+    already takes for the manifest: a source modified since the batch was
+    validated cannot be the idle file that qualified.
+    """
+
+    def _touch_when(self, target: Path, *, on: Path) -> Callable[[Path, Path], None]:
+        """Move normally, but write to *target* the first time *on* is moved.
+
+        Stands in for the real event: something resumes the session and appends to
+        its replay log while the batch is part-way through being staged.
+        """
+        real = session_storage._move_file
+        state = {"done": False}
+
+        def _move(src: Path, dst: Path) -> None:
+            real(src, dst)
+            if not state["done"] and src == on:
+                state["done"] = True
+                with target.open("ab") as fh:
+                    fh.write(b"resumed")
+                future = time.time() + 5
+                os.utime(target, (future, future))
+
+        return _move
+
+    def test_the_revived_session_stays_in_place_and_is_named(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-2", size=16, age_days=400)
+
+        # The first session's cli half moves, and that is when the SECOND session's
+        # transcript is written to — the ordering a real resume would produce.
+        victim = crew_home / "sessions" / "dashboard_chat-2.jsonl"
+        trigger = kiro_home / "sessions" / "cli" / "aaaa1111.jsonl"
+        monkeypatch.setattr(session_storage, "_move_file", self._touch_when(victim, on=trigger))
+
+        batch = session_storage.move_to_trash(
+            ["aaaa1111", "bbbb2222"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1", "bbbb2222": "dashboard_chat-2"}),
+            now=_NOW,
+        )
+
+        assert batch.sessions == 1
+        assert batch.revived == ("bbbb2222",)
+        # Still resumable, both halves, exactly where they were.
+        assert victim.is_file()
+        assert (kiro_home / "sessions" / "cli" / "bbbb2222.jsonl").is_file()
+        # And nothing of it is in the batch.
+        staged = session_storage.trash_root() / batch.batch_id
+        assert not (staged / "crew" / "dashboard_chat-2.jsonl").exists()
+        assert not (staged / "cli" / "bbbb2222.jsonl").exists()
+        # The session that was genuinely idle still moved.
+        assert (staged / "cli" / "aaaa1111.jsonl").is_file()
+
+    def test_a_half_that_already_moved_is_put_back(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Revival found on a LATER file must not leave the session split."""
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+
+        cli_log = kiro_home / "sessions" / "cli" / "aaaa1111.jsonl"
+        monkeypatch.setattr(session_storage, "_move_file", self._touch_when(transcript, on=cli_log))
+
+        with pytest.raises(SessionStorageError, match="resumed while being staged"):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index({"aaaa1111": "dashboard_chat-1"}),
+                now=_NOW,
+            )
+
+        # The half that had already moved is back where it belongs.
+        assert cli_log.is_file()
+        assert transcript.is_file()
+
+    def test_a_resume_between_the_refresh_and_the_loop_is_caught(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The anchor is taken before the scan, so this window is covered too.
+
+        An anchor stamped after the authority checks would miss this: the write
+        lands while ``refresh`` runs, so its mtime is older than any later stamp
+        and the session would be staged while live. Driving it through *refresh*
+        puts the write exactly where a resume during the scan would land.
+        """
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        victim = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        mapping = {"aaaa1111": "dashboard_chat-1"}
+
+        def _refresh_and_resume() -> SessionIndex:
+            # A real resume writes at the current instant, NOT in the future, and
+            # that is the whole point of this test: an mtime of "now" is newer than
+            # an anchor taken at entry and OLDER than one taken after these checks,
+            # so only the early anchor catches it. The sleep makes the ordering
+            # measurable rather than trusting sub-microsecond clock resolution.
+            time.sleep(0.01)
+            with victim.open("ab") as fh:
+                fh.write(b"resumed")
+            written = time.time()
+            os.utime(victim, (written, written))
+            # Deliberately reports the session as retired: this pins the mtime
+            # guard, not the index re-read that already covers a MAPPED session.
+            return _index(mapping)
+
+        with pytest.raises(SessionStorageError, match="resumed while being staged"):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index(mapping),
+                now=_NOW,
+                refresh=_refresh_and_resume,
+            )
+
+        assert victim.is_file()
+        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
+
+    def test_a_revival_whose_rollback_cannot_finish_is_not_claimed_as_left_alone(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reporting revival is a claim, so it must not outlive a failed rollback.
+
+        Putting a file back is deliberately non-overwriting, so a resume that
+        recreates an origin makes the rollback incomplete: the staged copy stays in
+        the batch, unlisted by its manifest. Saying the session was "left in place"
+        would then be false, and restore could not see the orphan either.
+        """
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        cli_log = kiro_home / "sessions" / "cli" / "aaaa1111.jsonl"
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+
+        real = session_storage._move_file
+        state = {"done": False}
+
+        def _resume_recreating_the_origin(src: Path, dst: Path) -> None:
+            real(src, dst)
+            if not state["done"] and src == cli_log:
+                state["done"] = True
+                # The resume recreates the half that just moved AND writes the
+                # other one — the ordering that makes the rollback decline.
+                cli_log.write_bytes(b"live again")
+                with transcript.open("ab") as fh:
+                    fh.write(b"resumed")
+                future = time.time() + 5
+                for path in (cli_log, transcript):
+                    os.utime(path, (future, future))
+
+        monkeypatch.setattr(session_storage, "_move_file", _resume_recreating_the_origin)
+
+        with pytest.raises(SessionStorageError, match="could not be fully put back"):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index({"aaaa1111": "dashboard_chat-1"}),
+                now=_NOW,
+            )
+
+        # The live session keeps what the resume wrote — the rollback must never
+        # overwrite it with the staged copy.
+        assert cli_log.read_bytes() == b"live again"
+        assert transcript.is_file()
+
+        # And whatever could not be put back is IN the manifest, because an
+        # unlisted file in a batch is reachable by neither restore nor empty.
+        batches = list(session_storage.trash_root().iterdir())
+        assert len(batches) == 1
+        entries = [
+            json.loads(line)
+            for line in (batches[0] / session_storage.MANIFEST_NAME).read_text().splitlines()
+            if line.strip()
+        ]
+        staged_records = [e for e in entries if e.get("uid") == "aaaa1111"]
+        assert staged_records, "the stranded half was left out of the manifest"
+        rels = {record["rel"] for record in staged_records[0]["files"]}
+        assert rels, "an entry with no files cannot be restored"
+        for rel in rels:
+            assert (batches[0] / rel).is_file()
+
+    def test_an_untouched_batch_reports_nothing_revived(self, stores: tuple[Path, Path]) -> None:
+        """The guard must not fire on the ordinary case, or every reclaim breaks."""
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+
+        assert batch.sessions == 1
+        assert batch.revived == ()
+
+
 class TestRestoreIsAllOrNothing:
     def test_restores_every_half(self, stores: tuple[Path, Path]) -> None:
         crew_home, kiro_home = stores
@@ -458,14 +670,14 @@ class TestRestoreIsAllOrNothing:
         _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
         _transcript(crew_home, "dashboard_chat-1", size=8, age_days=40)
         target = crew_home / "sessions" / "dashboard_chat-1.jsonl"
-        real_size = session_storage._file_size
+        real_stamp = session_storage._file_stamp
 
-        def flaky_size(path: Path) -> int:
+        def flaky_stamp(path: Path) -> tuple[int, float]:
             if path == target:
                 raise OSError("simulated transient stat failure")
-            return real_size(path)
+            return real_stamp(path)
 
-        monkeypatch.setattr(session_storage, "_file_size", flaky_size)
+        monkeypatch.setattr(session_storage, "_file_stamp", flaky_stamp)
 
         with pytest.raises(SessionStorageError, match="none of the selected"):
             session_storage.move_to_trash(
@@ -765,6 +977,40 @@ class TestManifestPersistenceFailure:
         assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
         assert session_storage.list_trash() == []
 
+    def test_rewrite_fsyncs_before_publishing_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A crash after publish must not expose manifest bytes still only in cache."""
+        from kiro_crew import atomic_write as atomic_write_module
+
+        batch = tmp_path / "batch"
+        batch.mkdir()
+        events: list[str] = []
+        real_fsync = atomic_write_module.os.fsync
+        real_replace = atomic_write_module.replace_with_retry
+
+        def tracking_fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def tracking_replace(src: str | Path, dst: str | Path) -> None:
+            events.append("replace")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(atomic_write_module.os, "fsync", tracking_fsync)
+        monkeypatch.setattr(atomic_write_module, "replace_with_retry", tracking_replace)
+        header = {"schema": session_storage.MANIFEST_SCHEMA, "batch_id": "batch"}
+        entries = [{"uid": "aaaa1111", "files": []}]
+
+        session_storage._rewrite_manifest(batch, header, entries)
+
+        assert events.index("fsync") < events.index("replace")
+        manifest = batch / session_storage.MANIFEST_NAME
+        assert [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()] == [
+            header,
+            *entries,
+        ]
+
 
 class TestBatchIdentityIsTheDirectory:
     def test_a_header_naming_another_batch_is_not_offered(self, stores: tuple[Path, Path]) -> None:
@@ -894,9 +1140,22 @@ class TestTrashBatchNamesAreLogSafe:
             "missing": None,
             "disagreeing": ({"batch_id": "someone-else", "created_at": _NOW}, 0, 0),
         }
+
+        # Forge ONLY the trash root's own enumeration, via a Path subclass whose
+        # `iterdir` yields the double. Patching `session_storage.Path.iterdir`
+        # (i.e. `pathlib.Path.iterdir`) globally leaks across the xdist worker:
+        # a sibling test in the same process that legitimately iterates a real
+        # directory then reaches the unpatched `_summarize_manifest`, which does
+        # `<_ForgedDir> / MANIFEST_NAME` and raises TypeError (refs #6425).
+        class _ForgedRoot(type(session_storage.trash_root())):
+            def iterdir(self):  # type: ignore[override]
+                return iter([_ForgedDir()])
+
+        forged_root = _ForgedRoot(session_storage.trash_root())
+
         for label, parsed in manifests.items():
             caplog.clear()
-            monkeypatch.setattr(session_storage.Path, "iterdir", lambda self: iter([_ForgedDir()]))
+            monkeypatch.setattr(session_storage, "trash_root", lambda: forged_root)
             monkeypatch.setattr(
                 session_storage.platform_compat, "is_link_or_junction", lambda p: False
             )
@@ -1314,6 +1573,389 @@ class TestScanCache:
 
         assert session_storage.list_units(_index()) == []
 
+    def test_a_hit_is_served_for_an_equal_but_distinct_pairing_dict(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The key compares the pairing by value, so a fresh dict of equal
+        contents must reuse the pass — callers rebuild the mapping per call."""
+        crew_home, kiro_home = stores
+        stem1 = transcript_stem("dashboard:chat-1")
+        stem2 = transcript_stem("dashboard:chat-2")
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=32, age_days=40)
+        _transcript(crew_home, stem1, size=64, age_days=40)
+        _transcript(crew_home, stem2, size=64, age_days=40)
+
+        session_storage.list_units(_multi_index({stem1: "aaaa1111", stem2: "bbbb2222"}))  # prime
+
+        calls = 0
+        real = session_storage._scan_raw_uncached
+
+        def counted(sid_for_stem):
+            nonlocal calls
+            calls += 1
+            return real(sid_for_stem)
+
+        monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
+        # A distinct dict object with equal contents built in the opposite
+        # insertion order, so an order-sensitive comparison would also miss.
+        session_storage.list_units(_multi_index({stem2: "bbbb2222", stem1: "aaaa1111"}))
+
+        assert calls == 0, "an equal-by-value pairing must be served from the cached pass"
+
+    def test_a_repointed_stem_with_unchanged_length_is_a_miss(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One stem repointed to a different sid, same mapping length, must
+        re-enumerate.
+
+        This is the behavioural pin for the failure an ``id()``/``len()``
+        memoisation of the pairing would permit: a length-preserving repoint
+        served from a pass built under the old pairing. The deterministic
+        key-level half lives in
+        :meth:`test_scan_key_distinguishes_same_length_mappings` — this test
+        alone cannot force CPython to recycle the first dict's ``id()``.
+        """
+        crew_home, kiro_home = stores
+        stem1 = transcript_stem("dashboard:chat-1")
+        stem2 = transcript_stem("dashboard:chat-2")
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=32, age_days=40)
+        _transcript(crew_home, stem1, size=64, age_days=40)
+        _transcript(crew_home, stem2, size=64, age_days=40)
+
+        session_storage.list_units(_multi_index({stem1: "aaaa1111", stem2: "bbbb2222"}))  # prime
+
+        calls = 0
+        real = session_storage._scan_raw_uncached
+
+        def counted(sid_for_stem):
+            nonlocal calls
+            calls += 1
+            return real(sid_for_stem)
+
+        monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
+        # Same keys, same length — only one value repointed.
+        session_storage.list_units(_multi_index({stem1: "aaaa1111", stem2: "aaaa1111"}))
+
+        assert calls == 1, "a repointed pairing must not be answered from the old pass"
+
+    def test_a_callers_in_place_edit_after_priming_is_a_miss(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stored key must be a snapshot, not an alias of the caller's dict.
+
+        ``dict(sid_for_stem)`` is the only thing making it one — passing the
+        mapping straight through still satisfies the type annotation. Aliased,
+        a caller's in-place repoint would mutate the stored key in lockstep,
+        so the stale pass would compare EQUAL to the new pairing and be served
+        as a hit — the exact failure the key exists to prevent.
+        """
+        crew_home, kiro_home = stores
+        stem1 = transcript_stem("dashboard:chat-1")
+        stem2 = transcript_stem("dashboard:chat-2")
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=32, age_days=40)
+        _transcript(crew_home, stem1, size=64, age_days=40)
+        _transcript(crew_home, stem2, size=64, age_days=40)
+
+        pairing = {stem1: "aaaa1111", stem2: "bbbb2222"}
+        session_storage.list_units(SessionIndex(stem_to_sid=pairing))  # prime
+
+        calls = 0
+        real = session_storage._scan_raw_uncached
+
+        def counted(sid_for_stem):
+            nonlocal calls
+            calls += 1
+            return real(sid_for_stem)
+
+        monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
+        pairing[stem2] = "aaaa1111"  # the caller's own dict, edited in place
+        session_storage.list_units(SessionIndex(stem_to_sid=pairing))
+
+        assert calls == 1, "an in-place repoint must miss; the stored key may not alias it"
+
+    def test_scan_key_distinguishes_same_length_mappings(self) -> None:
+        """Deterministic key-level guard against a length-based pairing key.
+
+        The pairing element must compare unequal for same-length mappings that
+        differ in one value — this is what rules out memoising on
+        ``id()``+``len()`` (CPython reuses ``id()`` after garbage collection,
+        so identity plus length cannot stand in for contents).
+        """
+        a = session_storage._scan_key({"s1": "aaaa", "s2": "bbbb"})
+        b = session_storage._scan_key({"s1": "aaaa", "s2": "aaaa"})
+        assert a[2] != b[2], "same-length repointed mappings must produce unequal keys"
+
+    def test_scan_key_is_unhashable_so_it_can_never_be_a_hash_key(self) -> None:
+        """The docstring's "never hashed" is enforced by the interpreter.
+
+        A future refactor that hashes the key (a dict-keyed cache, a set of
+        keys) must fail loudly at runtime, not silently collide.
+        """
+        with pytest.raises(TypeError):
+            hash(session_storage._scan_key({"a": "1"}))
+
+    def test_scan_key_pairing_equality_matches_the_sorted_tuple_form(self) -> None:
+        """``dict(a) == dict(b)`` iff ``tuple(sorted(a.items())) == tuple(sorted(b.items()))``.
+
+        This pins the equivalence the key relies on: the dict snapshot answers the
+        equality question identically to the sorted-tuple form it replaced, across
+        empty, single-entry, reordered, repointed and disjoint mappings. Compares
+        the pairing element directly so the assertion is about the pairing alone —
+        a store-path difference cannot mask a pairing disagreement.
+        """
+        mappings: list[dict[str, str]] = [
+            {},
+            {"a": "1"},
+            {"b": "1"},  # key differs, value identical
+            {"a": "1", "b": "2"},
+            {"b": "2", "a": "1"},  # same contents, different insertion order
+            {"a": "1", "b": "3"},  # one value repointed, same length
+            {"a": "2", "b": "1"},  # values swapped
+            {"c": "9"},
+        ]
+        for a in mappings:
+            for b in mappings:
+                expected = tuple(sorted(a.items())) == tuple(sorted(b.items()))
+                got = session_storage._scan_key(a)[2] == session_storage._scan_key(b)[2]
+                assert got == expected, f"disagreement on {a!r} vs {b!r}"
+
+
+class TestCotenantCache:
+    """The co-tenant lookup follows the scan cache's rules: reads may reuse, mutations never.
+
+    :func:`_scan_units` is the single funnel for four public entry points, and its
+    co-tenant dependency used to bypass the 30s cache entirely — every read paid a
+    pod-root enumeration plus a map read per leftover pod even on a scan-cache hit.
+    The cache is OPT-IN per call site because the same value gates destructive
+    paths; the safety tests below are what stop a later refactor from making it
+    global.
+
+    One uncached pass deliberately remains on a default install: ``measure``
+    populates ``reclaim_blocked_reason`` via :func:`reclaim_block_reason`, whose
+    co-tenant read must never opt in (it derives a refusal). The isolated *stores*
+    fixture short-circuits that path, which is why the reuse test below counts 1;
+    the default-home test pins that the gate really does re-read.
+    """
+
+    @staticmethod
+    def _count_pod_scans(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+        """Count full passes over the pod root without changing their answer."""
+        calls = {"n": 0}
+        real = session_storage._replay_store_cotenants
+
+        def counted() -> list[str]:
+            calls["n"] += 1
+            return real()
+
+        monkeypatch.setattr(session_storage, "_replay_store_cotenants", counted)
+        return calls
+
+    def test_a_read_inside_the_ttl_does_not_rescan_the_pod_root(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A scan-cache hit must not still pay for the co-tenant half."""
+        _, kiro_home = stores
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        calls = self._count_pod_scans(monkeypatch)
+
+        index = _index()
+        session_storage.list_units(index)
+        session_storage.measure(index, now=_NOW)
+        session_storage.list_units(index)
+
+        assert calls["n"] == 1, "reads within the TTL must enumerate the pod root once"
+
+    def test_select_reclaimable_rereads_cotenants_on_every_call(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reclaim selection derives refusals from this value: never from a snapshot."""
+        _, kiro_home = stores
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        session_storage.list_units(_index())  # prime both caches
+        calls = self._count_pod_scans(monkeypatch)
+
+        session_storage.select_reclaimable(_index(), 30.0, now=_NOW)
+        session_storage.select_reclaimable(_index(), 30.0, now=_NOW)
+
+        assert calls["n"] == 2, "a mutation-path selection must re-read co-tenants every call"
+
+    def test_move_to_trash_rereads_cotenants_on_every_call(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both the scan inside the move and the pre-move authority check must be live.
+
+        The pre-move re-read exists precisely because the view taken during the
+        scan is seconds stale by the time anything moves; a primed cache must not
+        be allowed to answer it.
+        """
+        _, kiro_home = stores
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        _cli_half(kiro_home, "aaaa1111", log_bytes=64, age_days=40)
+        session_storage.list_units(_index())  # prime both caches
+        calls = self._count_pod_scans(monkeypatch)
+
+        session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW)
+
+        assert calls["n"] == 2, "the move's scan and its authority re-read must each hit disk"
+
+    def test_invalidate_scan_cache_drops_the_cotenant_pass_too(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mutation hooks clear one thing; both caches must go with it."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        calls = self._count_pod_scans(monkeypatch)
+
+        session_storage.list_units(_index())
+        session_storage.invalidate_scan_cache()
+        session_storage.list_units(_index())
+
+        assert calls["n"] == 2, "invalidation must force a fresh co-tenant pass"
+
+    def test_a_different_pod_root_is_not_answered_from_an_older_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``KIROCREW_POD_ROOT`` resolves per call, so the root keys the cache.
+
+        Same reasoning as the store locations in the scan key: keyed without the
+        location, the second root would be answered with the first's pass.
+        """
+        first = tmp_path / "pods-a"
+        pod = first / "wt-old"
+        pod.mkdir(parents=True)
+        # Own replay store: its sids are recorded but it constrains nothing.
+        (pod / "kiro").mkdir()
+        (pod / "session_map.json").write_text(
+            json.dumps({"dashboard:chat-1": {"sid": "podsid01"}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(first))
+        protected, refusals = session_storage.cotenant_sids(cached=True)
+        assert protected == frozenset({"podsid01"})
+        assert refusals == ()
+
+        second = tmp_path / "pods-b"
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(second))
+        assert session_storage.cotenant_sids(cached=True) == (
+            frozenset(),
+            (),
+        ), "an empty pod root must read as empty, not as the first root's pass"
+
+    def test_a_different_crew_home_is_not_answered_from_an_older_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``KIROCREW_HOME`` alone keys the cache.
+
+        Each map is read through ``hooks.safe_read_file``, whose sensitive-path
+        READ gate re-anchors on the raw ``KIROCREW_HOME`` — the same symlinked
+        map can be refused under one anchoring and readable under another, so a
+        pass taken under one must not answer for the other. Varied ALONE so the
+        term is ratcheted independently, not only as part of a pair.
+        """
+        pod_root = tmp_path / "pods"
+        (pod_root / "wt-x").mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "home-a" / "kiro"))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home-a"))
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.cotenant_sids(cached=True)
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home-b"))
+        session_storage.cotenant_sids(cached=True)
+
+        assert calls["n"] == 2, "a changed KIROCREW_HOME must not be served the old pass"
+
+    def test_a_different_kiro_home_is_not_answered_from_an_older_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``KIRO_HOME`` alone keys the cache — defensive over-keying, ratcheted.
+
+        Today the read tier re-anchors on ``KIROCREW_HOME`` only, but the gate's
+        anchor set is keyed on both raw values; keeping ``KIRO_HOME`` in this key
+        means a future read-tier anchor cannot silently start serving stale
+        answers. A spurious miss costs a re-scan; a spurious hit would cost a
+        wrong answer.
+        """
+        pod_root = tmp_path / "pods"
+        (pod_root / "wt-x").mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home-a"))
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "home-a" / "kiro"))
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.cotenant_sids(cached=True)
+
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "home-b" / "kiro"))
+        session_storage.cotenant_sids(cached=True)
+
+        assert calls["n"] == 2, "a changed KIRO_HOME must not be served the old pass"
+
+    def test_reclaim_block_reason_rereads_cotenants_despite_a_primed_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The hard reclaim gate must never opt in — and nothing else covered it.
+
+        The isolated *stores* fixture short-circuits :func:`reclaim_block_reason`
+        before its co-tenant read, so the other safety tests never execute that
+        call. This pins the DEFAULT-home posture, where the read actually runs,
+        and asserts a primed cache does not answer it — the ratchet that stops a
+        future perf change from threading ``cached=`` through the gate.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        # Pin the default home rather than clearing the memo; see
+        # TestSharedStoreRefusal for why re-resolving on a real machine is unsafe.
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+        session_storage.cotenant_sids(cached=True)  # prime
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.reclaim_block_reason()
+        session_storage.reclaim_block_reason()
+
+        assert calls["n"] == 2, "the reclaim gate must re-enumerate the pod root on every call"
+
+    def test_reclaim_block_reason_reuses_cache_when_cached_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Display callers passing cached=True reuse the primed co-tenant pass."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+        session_storage.cotenant_sids(cached=True)  # prime
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.reclaim_block_reason(cached=True)
+        session_storage.reclaim_block_reason(cached=True)
+
+        assert calls["n"] == 0, "cached=True must reuse the primed co-tenant cache"
+
+    def test_measure_reuses_primed_cotenant_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """measure() opts into cached=True to avoid an extra co-tenant scan."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+        session_storage.cotenant_sids(cached=True)  # prime
+        calls = self._count_pod_scans(monkeypatch)
+        report = session_storage.measure(
+            session_storage.SessionIndex(),
+            units=[],
+            batches=[],
+        )
+
+        assert calls["n"] == 0, "measure() must reuse the primed co-tenant cache"
+        assert isinstance(report.reclaim_blocked_reason, str)
+
 
 class TestSharedStoreRefusal:
     """An isolated data home over a shared replay store cannot see who is live."""
@@ -1579,7 +2221,9 @@ class TestSharedStoreRefusal:
 
         calls = {"n": 0}
 
-        def claimed_late() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+        def claimed_late(
+            *, cached: bool = False
+        ) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             calls["n"] += 1
             # Empty while the scan runs; owned by the time the move is authorized.
             return (frozenset() if calls["n"] == 1 else frozenset({"adopted001"})), ()
@@ -1599,7 +2243,9 @@ class TestSharedStoreRefusal:
 
         calls = {"n": 0}
 
-        def unreadable_late() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+        def unreadable_late(
+            *, cached: bool = False
+        ) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             calls["n"] += 1
             return frozenset(), (() if calls["n"] == 1 else (("wt-corrupt", "unreadable map"),))
 
@@ -1703,7 +2349,11 @@ class TestSharedStoreRefusal:
         """
         _, kiro_home = stores
         _cli_half(kiro_home, "podsid01", log_bytes=64, age_days=40)
-        monkeypatch.setattr(session_storage, "cotenant_sids", lambda: (frozenset({"podsid01"}), ()))
+        monkeypatch.setattr(
+            session_storage,
+            "cotenant_sids",
+            lambda *, cached=False: (frozenset({"podsid01"}), ()),
+        )
 
         with pytest.raises(SessionStorageError, match="still in use"):
             session_storage.move_to_trash(["podsid01"], reason="manual", index=_index(), now=_NOW)
@@ -1985,6 +2635,190 @@ class TestSharedStoreRefusal:
         report = session_storage.measure(_index(), now=_NOW)
 
         assert "sits outside it" in report.reclaim_blocked_reason
+
+
+class TestCotenantNamesAreLogSafe:
+    """A co-tenant directory name is agent-influenced and can embed a newline;
+    both ``cotenant_sids`` log sites that carry it must escape it, or one record
+    forges additional records (refs #6371, the #6281/#6315 log-forgery class).
+    """
+
+    _FORGED = "wt-evil\nWARNING forged: reclaim authorized by operator"
+
+    def _pod_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        pod_root = tmp_path / "pods"
+        pod_root.mkdir()
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        return pod_root
+
+    def _make_forged_pod(self, pod_root: Path) -> Path:
+        pod = pod_root / self._FORGED
+        try:
+            pod.mkdir()
+        except OSError:
+            pytest.skip("this filesystem refuses a newline in a directory name")
+        return pod
+
+    @staticmethod
+    def _carrying(caplog: pytest.LogCaptureFixture, marker: str) -> list[str]:
+        return [record.getMessage() for record in caplog.records if marker in record.getMessage()]
+
+    def test_malformed_map_log_escapes_the_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pod = self._make_forged_pod(self._pod_root(tmp_path, monkeypatch))
+        (pod / "session_map.json").write_text("not json{", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            _protected, refusals = session_storage.cotenant_sids()
+
+        assert [name for name, _why in refusals] == [self._FORGED]
+        messages = self._carrying(caplog, "malformed session map")
+        assert messages, "the malformed-map site did not log at all"
+        # The rendered record stays one line: the name appears repr'd, and the
+        # injected second line never starts a record of its own.
+        assert all("\n" not in message for message in messages)
+        assert any(repr(self._FORGED) in message for message in messages)
+
+    def test_unreadable_map_log_escapes_the_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pod = self._make_forged_pod(self._pod_root(tmp_path, monkeypatch))
+        # Invalid UTF-8 makes ``safe_read_file`` raise ``UnicodeDecodeError``,
+        # which is exactly the unreadable-map warning path under test.
+        (pod / "session_map.json").write_bytes(b"\xff\xfe\xfa")
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            _protected, refusals = session_storage.cotenant_sids()
+
+        assert [name for name, _why in refusals] == [self._FORGED]
+        messages = self._carrying(caplog, "unreadable session map")
+        assert messages, "the unreadable-map site did not log at all"
+        assert all("\n" not in message for message in messages)
+        assert any(repr(self._FORGED) in message for message in messages)
+
+    def test_exc_info_rendering_does_not_carry_a_raw_newline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The unreadable-map site logs with ``exc_info=True``, and
+        ``safe_read_file``'s refusal messages embed the resolved path — which
+        keeps a newline-bearing directory name. The FULL rendered record
+        (message plus exception text) must stay forge-free, not just the
+        ``getMessage()`` line the other tests pin.
+        """
+        pod = self._make_forged_pod(self._pod_root(tmp_path, monkeypatch))
+        (pod / "session_map.json").write_text("{}", encoding="utf-8")
+        # Force the refusal arm so the raised PermissionError carries the real
+        # resolved path (newline included) into the traceback rendering.
+        monkeypatch.setattr(session_storage.hooks, "is_sensitive_path", lambda p: True)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            _protected, refusals = session_storage.cotenant_sids()
+
+        assert [name for name, _why in refusals] == [self._FORGED]
+        assert "unreadable session map" in caplog.text
+        # The injected payload never lands at the start of a rendered line,
+        # which is what a forged record would need.
+        assert not [line for line in caplog.text.splitlines() if line.startswith("WARNING forged")]
+
+    def test_both_sites_escape_without_touching_the_filesystem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Windows refuses a newline in a real directory name, which would skip
+        the two filesystem tests above on those shards. Injecting the forged
+        name at the candidate-list seam pins both log sites on every platform.
+        """
+        self._pod_root(tmp_path, monkeypatch)
+        monkeypatch.setattr(session_storage, "_replay_store_cotenants", lambda: [self._FORGED])
+
+        reads: dict[str, object] = {
+            "unreadable": PermissionError("refused"),
+            "malformed": "not json{",
+        }
+        for label, outcome in reads.items():
+
+            def _read(path: str, outcome: object = outcome) -> str:
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return str(outcome)
+
+            caplog.clear()
+            monkeypatch.setattr(session_storage.hooks, "safe_read_file", _read)
+
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+                _protected, refusals = session_storage.cotenant_sids()
+
+            assert [name for name, _why in refusals] == [self._FORGED]
+            rendered = [record.getMessage() for record in caplog.records]
+            carrying = [message for message in rendered if repr(self._FORGED) in message]
+            assert carrying, f"the {label}-map site did not log the name repr'd"
+            assert all("\n" not in message for message in rendered)
+
+
+class TestCotenantRefusalTextIsForgeSafe:
+    """The raw co-tenant name also exits ``cotenant_sids`` inside the refusals
+    tuples and is interpolated into two downstream refusal-text surfaces. Neither
+    is a log line today, but one caller-side ``logger.warning(str(exc))`` away
+    from re-opening the #6281/#6371 forgery class — so both must carry the name
+    repr'd, exactly like the log sites ``TestCotenantNamesAreLogSafe`` pins
+    (refs #6430).
+    """
+
+    _FORGED = "wt-evil\nWARNING forged: reclaim authorized by operator\x1b[31m"
+    _REFUSALS = ((_FORGED, "its session map could not be parsed"),)
+
+    def test_reclaim_block_reason_escapes_the_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The listed refusals in the block reason render one-line and escaped.
+
+        Injected at the ``cotenant_sids`` seam rather than through the pod root:
+        Windows refuses a newline in a real directory name, and what is under
+        test is the CONSUMER's rendering, not discovery.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        monkeypatch.setattr(
+            session_storage, "cotenant_sids", lambda *, cached=False: (frozenset(), self._REFUSALS)
+        )
+
+        reason = session_storage.reclaim_block_reason()
+
+        assert "make reclaiming unsafe" in reason
+        assert repr(self._FORGED) in reason
+        # One line, no raw control bytes: the injected second record and the
+        # ANSI payload both survive only inside the repr's escapes.
+        assert "\n" not in reason
+        assert "\x1b" not in reason
+
+    def test_move_to_trash_refusal_error_escapes_the_name(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``SessionStorageError`` raised at the move renders one-line and
+        escaped, so a caller logging ``str(exc)`` cannot be used to forge a
+        second record.
+        """
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=64, age_days=40)
+        monkeypatch.setattr(
+            session_storage, "cotenant_sids", lambda *, cached=False: (frozenset(), self._REFUSALS)
+        )
+
+        with pytest.raises(SessionStorageError, match="make reclaiming unsafe") as excinfo:
+            session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW)
+
+        text = str(excinfo.value)
+        assert repr(self._FORGED) in text
+        assert "\n" not in text
+        assert "\x1b" not in text
+        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
 
 
 class TestBuckets:

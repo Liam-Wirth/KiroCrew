@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib.util
 import json
 import logging
 import os
@@ -49,7 +50,11 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
     slack_options_owner_key,
 )
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.handlers._shared import (
+    _pip_install_channel_available,
+    pip_extra_install_command,
+    read_bounded_json,
+)
 from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_request
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_END,
@@ -81,7 +86,9 @@ from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
+    CHANNEL_MAX_LEN,
     CRON_SESSION_RE,
+    SLACK_THREAD_TS_RE,
     SPAWN_RUN_SCHEMA,
     ValidationError,
     validate_tool_args,
@@ -89,6 +96,28 @@ from kiro_crew.validation import (
 
 #: Seconds to wait for Slack when verifying a pasted token at save time.
 _TOKEN_VERIFY_TIMEOUT = 8
+
+#: A Slack message timestamp is `<10-digit epoch>.<6-digit sequence>` -- 17
+#: characters. The cap is what BOUNDS the value: these routes forward `ts` to
+#: Slack and write it into a SEL audit line, and the allowlist check that
+#: rejects an untracked channel runs AFTER that line is written.
+_SLACK_TS_MAX_LEN = 30
+
+
+def _is_slack_ts(value: object) -> bool:
+    """True for a Slack message timestamp that is safe to forward.
+
+    Uses the shared ``SLACK_THREAD_TS_RE`` rather than an inline
+    ``^\\d+\\.\\d+$``: ``\\d`` is Unicode-aware, so a string of Arabic-Indic
+    numerals satisfied the old check and was forwarded verbatim. The shared
+    pattern spells the class ``[0-9]`` to avoid precisely that.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) <= _SLACK_TS_MAX_LEN
+        and bool(SLACK_THREAD_TS_RE.match(value))
+    )
+
 
 #: Public field name -> .env credential key for the two Slack secrets.
 _SLACK_SECRET_FIELDS = {
@@ -1834,7 +1863,7 @@ async def api_send_message(request: web.Request) -> web.Response:
 
     thread_ts = body.get("thread_ts")
     if thread_ts is not None:
-        if not isinstance(thread_ts, str) or not re.match(r"^\d+\.\d+$", thread_ts):
+        if not _is_slack_ts(thread_ts):
             return web.json_response(
                 {"error": "thread_ts must be a Slack timestamp string like '1712793600.123456'"},
                 status=400,
@@ -2440,12 +2469,12 @@ async def api_slack_pins(request: web.Request) -> web.Response:
     if not isinstance(channel, str):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     channel = channel.strip()
-    if not channel or not CHANNEL_ID_RE.match(channel):
+    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
 
     ts = body.get("ts", "")
     if action in ("add", "remove"):
-        if not isinstance(ts, str) or not re.match(r"^\d+\.\d+$", ts):
+        if not _is_slack_ts(ts):
             return web.json_response(
                 {"error": "ts must be a Slack timestamp string like '1712793600.123456'"},
                 status=400,
@@ -2535,10 +2564,10 @@ async def api_slack_reactions(request: web.Request) -> web.Response:
     if not isinstance(channel, str):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     channel = channel.strip()
-    if not channel or not CHANNEL_ID_RE.match(channel):
+    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     ts = body.get("ts", "")
-    if not isinstance(ts, str) or not re.match(r"^\d+\.\d+$", ts):
+    if not _is_slack_ts(ts):
         return web.json_response(
             {"error": "ts must be a Slack timestamp string like '1712793600.123456'"},
             status=400,
@@ -2780,9 +2809,9 @@ def _deny_non_owner_browser_request(request: web.Request, operation: str) -> web
     """
     # Deferred import: source_providers imports chat state helpers from this
     # module's sibling, so a top-level import would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
     from kiro_crew.dashboard.handlers.source_providers import (
         is_owner_dashboard_request,
-        stale_owner_session_response,
     )
 
     if is_owner_dashboard_request(request):
@@ -2819,13 +2848,7 @@ def _deny_non_owner_browser_request(request: web.Request, operation: str) -> web
     )
     # Deny decision made above; only the response label changes for a signed
     # pre-owner bootstrap subject (see stale_owner_session_response).
-    stale = stale_owner_session_response(request)
-    if stale is not None:
-        return stale
-    return web.json_response(
-        {"error": "dashboard user required", "code": "dashboard_user_required"},
-        status=403,
-    )
+    return _owner_denial_response(request, "dashboard user required", "dashboard_user_required")
 
 
 async def api_browser_token_put(request: web.Request) -> web.Response:
@@ -3215,7 +3238,9 @@ async def api_browser_view_start(request: web.Request) -> web.Response:
 
     Idempotent, and off-loaded to a thread because starting the dashboard waits on
     a child process becoming healthy, which would otherwise stall the event loop
-    and with it every other dashboard request.
+    and with it every other dashboard request. Honors
+    ``dashboard.browser_view_port`` when set, so a remote-gateway operator can
+    keep the port inside their tunnel's forwarded set.
 
     App-token denied: this both LAUNCHES a browser process and returns the
     unauthenticated dashboard URL, so it is the stronger half of the same hole
@@ -3224,7 +3249,14 @@ async def api_browser_view_start(request: web.Request) -> web.Response:
     denied = _deny_non_owner_browser_request(request, "browser_view_start")
     if denied is not None:
         return denied
-    await asyncio.to_thread(browser_cli_view.ensure_running)
+
+    def _start_view() -> None:
+        # Config read stays in the worker thread with the child-process wait:
+        # both are blocking I/O that must not run on the event loop.
+        pinned = KiroCrewConfig.load().dashboard.browser_view_port
+        browser_cli_view.ensure_running(pinned or None)
+
+    await asyncio.to_thread(_start_view)
     return web.json_response(await asyncio.to_thread(browser_cli_view.status))
 
 
@@ -3642,8 +3674,8 @@ async def _slack_config_save_locked(request: web.Request) -> web.Response:
 
     # ── Phase 2: commit. All validation passed, so writes are safe. ──
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         await _write_env_off_loop(env_updates)
         # Keep the live process environment in sync with the new .env state.
         # load_credentials() lets os.environ win over .env, so without this a
@@ -4069,8 +4101,8 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
                 relabel="session_folder" in staged,
             )
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         await _write_env_off_loop(env_updates)
         # Keep the live process environment in sync with the new .env state
         # (load_credentials() lets os.environ win over .env — see the Slack
@@ -4452,8 +4484,8 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
                 relabel="session_folder" in staged,
             )
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         await _write_env_off_loop(env_updates)
         # Keep the live process environment in sync with the new .env state
         # (load_credentials() lets os.environ win over .env — see the Slack
@@ -4589,8 +4621,8 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     throttled_source = "" if is_proxied_request(request) else source
     if throttled_source and webhooks.auth_throttle_blocked(throttled_source):
         # Off the loop: the first ``sel()`` of a process CONSTRUCTS the log
-        # (trust-dir creation, key validation, an icacls subprocess on Windows),
-        # and this route can be the first request a fresh gateway ever serves.
+        # (trust-dir creation, key validation — blocking file IO), and this
+        # route can be the first request a fresh gateway ever serves.
         await asyncio.to_thread(
             lambda: _sel().log_api_access(
                 caller=source,
@@ -5094,8 +5126,9 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
                     relabel="session_folder" in changes,
                 )
         if env_updates:
-            # Off-loop: restrict_to_owner spawns whoami/icacls subprocesses on
-            # Windows, which would stall the gateway loop if run inline.
+            # Off-loop: the .env write is blocking file IO (lock, temp write,
+            # owner-only lockdown, replace) that would stall the gateway loop
+            # if run inline.
             #
             # Cancellation guard: _write_env_off_loop shields + drains its
             # worker, so a CancelledError from it means the .env write has
@@ -5431,8 +5464,8 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
                     relabel="session_folder" in changes,
                 )
         if env_updates:
-            # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-            # which must not block the event loop.
+            # Off-loop: the .env write is blocking file IO (lock, temp write,
+            # owner-only lockdown, replace) and must not block the event loop.
             #
             # Cancellation guard: see Teams save for the full rationale. Only
             # roll config back when the .env write actually failed, not when
@@ -6022,8 +6055,8 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
                 relabel="session_folder" in staged,
             )
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         #
         # Cancellation guard: see Teams save for the full rationale. Only
         # roll config back when the .env write actually failed, not when
@@ -6095,6 +6128,50 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
 # group, which is why the panel shows a hint rather than silently doing nothing.
 
 
+# Channels whose SDK ships as an optional extra rather than in core. Maps the
+# channel to (import name, extra name) so the panel can report BOTH whether the
+# SDK is importable by this gateway process and the exact command that installs
+# it into this interpreter. Teams (PyJWT) and WhatsApp (neonize) have the same
+# shape and are one entry each when their panels adopt the card.
+_CHANNEL_SDK_EXTRA: dict[str, tuple[str, str]] = {
+    "feishu": ("lark_oapi", "feishu"),
+}
+
+
+def _channel_sdk_status(channel: str) -> tuple[bool, bool, str]:
+    """``(installed, install_supported, install_command)`` for *channel*'s extra.
+
+    Computed HERE rather than read off the connection badge, because the badge
+    cannot answer it in the case that matters. ``maybe_start_feishu`` returns at
+    its first line when the channel is disabled, and the ``ImportError`` branch
+    that records the missing SDK sits after that return — so a user who has not
+    yet flipped the enable toggle gets no hint at all, and one who has must
+    restart the gateway before the hint appears. This endpoint answers either
+    way and without a restart.
+
+    ``install_command`` is empty when it would be useless or actively wrong: the
+    SDK is already importable, or no install channel exists in this
+    build/interpreter (see :func:`_pip_install_channel_available` — on the
+    bundled desktop interpreter a pip install writes into the code-signed bundle
+    and is discarded on the next app update, so naming the command there is bad
+    advice rather than merely unhelpful).
+
+    Blocking: ``find_spec`` and the PEP 668 marker check both touch the
+    filesystem, so call it from a worker thread on an async path.
+    """
+    entry = _CHANNEL_SDK_EXTRA.get(channel)
+    if entry is None:
+        # No optional extra for this channel: nothing is ever missing, so the
+        # panel renders no card.
+        return True, False, ""
+    import_name, extra = entry
+    if importlib.util.find_spec(import_name) is not None:
+        return True, True, ""
+    if not _pip_install_channel_available():
+        return False, False, ""
+    return False, True, pip_extra_install_command(extra)
+
+
 def _is_valid_feishu_id(v: str, prefix: str) -> bool:
     """Feishu opaque-id shape check (linear string ops, no regex).
 
@@ -6129,11 +6206,15 @@ async def api_feishu_config_get(request: web.Request) -> web.Response:
     # rather than just this request. Read as ONE unit of work: the credential
     # read is a method on the config object, and splitting them into two hops
     # would let the two files be read either side of a concurrent save.
-    def _read() -> "tuple[KiroCrewConfig, dict]":
+    def _read() -> "tuple[KiroCrewConfig, dict, tuple[bool, bool, str]]":
         loaded = KiroCrewConfig.load()
-        return loaded, loaded.load_credentials()
+        # The SDK probe joins this same unit of work: find_spec and the PEP 668
+        # marker are filesystem reads, and the panel polls this endpoint every
+        # 15s, so giving them their own thread hop would double the cost of a
+        # poll for no isolation benefit.
+        return loaded, loaded.load_credentials(), _channel_sdk_status("feishu")
 
-    cfg, creds = await asyncio.to_thread(_read)
+    cfg, creds, (sdk_installed, sdk_supported, sdk_command) = await asyncio.to_thread(_read)
     app_id = creds.get(CRED_FEISHU_APP_ID, "")
     app_secret = creds.get(CRED_FEISHU_APP_SECRET, "")
     fs = cfg.feishu
@@ -6164,6 +6245,20 @@ async def api_feishu_config_get(request: web.Request) -> web.Response:
             "allowed_group_ids": list(fs.allowed_group_ids),
             "soft_threshold_pct": int(fs.soft_threshold_pct),
             "session_folder": fs.session_folder,
+            # The channel needs lark-oapi, which ships as the optional [feishu]
+            # extra. False means the gateway process cannot import it and the
+            # channel will be skipped at boot no matter how complete the rest of
+            # this config is.
+            "sdk_installed": sdk_installed,
+            # False in the three environments where a pip install cannot work
+            # (bundled desktop interpreter, no pip module, PEP 668
+            # externally-managed): the panel shows an unsupported notice instead
+            # of a command that would silently achieve nothing.
+            "sdk_install_supported": sdk_supported,
+            # Names THIS gateway's interpreter, because installing into the
+            # wrong environment is the actual failure mode. Empty when the SDK is
+            # present or no install channel exists.
+            "sdk_install_command": sdk_command,
         }
     )
 
@@ -6454,8 +6549,8 @@ async def _feishu_config_save_locked(request: web.Request) -> web.Response:
             return _corrupt_config()
 
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         #
         # Cancellation guard: see the WeCom save for the full rationale. Only
         # roll config back when the .env write actually failed, not when

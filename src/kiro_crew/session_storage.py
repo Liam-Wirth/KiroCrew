@@ -42,11 +42,13 @@ Reading is cached; reclaiming never is
 --------------------------------------
 Enumerating the stores is the entire cost of a read here — half a million replay
 files on the measured machine — so a pass is kept briefly and shared between the
-row list, the totals and each row's detail. Only the FILESYSTEM half is cached:
-which sessions are in use is recomputed from the caller's index every call, and
-every mutation re-enumerates and re-reads the index inside the lock. So no
-refusal is ever answered from a snapshot, and a stale cache can only make the
-report slightly old, never make a reclaim take something it should not.
+row list, the totals and each row's detail. Only the FILESYSTEM halves are
+cached — the store scan and, on read paths, the co-tenant pass beside it: the
+flags derived from the caller's index are recomputed every call, every
+refusal-deriving path runs uncached, and every mutation re-enumerates and
+re-reads the index inside the lock. So no refusal is ever answered from a
+snapshot, and a stale cache can only make the report slightly old, never make a
+reclaim take something it should not.
 
 Sessions this instance does not own
 -----------------------------------
@@ -77,6 +79,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import IO, Any
 
 from kiro_crew import hooks, platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import (
     CONFIG_DIR_LEAF,
     KIRO_BASE_DIR_NAME,
@@ -245,6 +248,12 @@ class TrashBatch:
     reason: str
     sessions: int
     bytes: int
+    #: Sessions that were selected, passed every authority check, and were then
+    #: found to have been written to while the batch was being staged — so they
+    #: were left in place. Empty for a batch read back off disk
+    #: (:func:`list_trash`), which describes what a batch CONTAINS; this field is
+    #: about what one move DECLINED, which only the move itself knows.
+    revived: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -329,9 +338,13 @@ def _archive_index() -> dict[str, list[tuple[Path, int, float]]]:
 # So a pass is kept for a few seconds and shared. Two properties make that safe
 # rather than merely faster:
 #
-# * Only the filesystem half is cached. Which sessions are active or live is
-#   applied over it from the caller's index on every call, so no refusal is ever
-#   decided from a snapshot.
+# * Only the filesystem halves are cached — the store scan and, on read paths,
+#   the co-tenant pass beside it (its own cache, further down). The flags derived
+#   from the caller's index are applied over them on every call, and every path
+#   that DERIVES A REFUSAL — the reclaim gates, the pre-move re-read, the
+#   dashboard's trash pre-classification — runs uncached, so no refusal is ever
+#   decided from a snapshot. The one cached contribution to ``active`` (the
+#   co-tenant set) therefore only ever staleness-affects what a read displays.
 # * Only READ paths opt in. A reclaim re-enumerates, and additionally re-reads
 #   the index inside the mutation lock, so the selection it acts on is current.
 #
@@ -356,14 +369,20 @@ def _scan_key(sid_for_stem: Mapping[str, str]) -> tuple[object, ...]:
 
     Pairing is the rest of it: it decides which unit a transcript belongs to, so a
     session that gained or lost its mapping must not be answered from an older
-    pass. Compared by value rather than hashed — a hash collision here would serve
-    a pass built under different assumptions, and the whole point of the key is
-    that it cannot.
+    pass. The mapping is compared directly by dict equality — still by value,
+    never hashed — because a hash collision here would serve a pass built under
+    different assumptions, and the whole point of the key is that it cannot.
+    Embedding the dict makes the key tuple unhashable, so "never hashed" is
+    enforced by the interpreter rather than by convention, and the hit check
+    is linear — one dict copy plus one dict compare — with no sort. The
+    ``dict()`` copy is load-bearing:
+    it snapshots the pairing, so a caller's later in-place edit cannot mutate
+    the stored key in lockstep and masquerade as a hit.
     """
     return (
         str(kiro_sessions_dir()),
         str(_crew_sessions_dir()),
-        tuple(sorted(sid_for_stem.items())),
+        dict(sid_for_stem),
     )
 
 
@@ -390,10 +409,20 @@ def invalidate_scan_cache() -> None:
     the cache is process-wide and its key covers the store paths and the pairing,
     not the CONTENTS of the stores, so a test that writes more files and re-reads
     inside the TTL would otherwise be answered from its own earlier pass.
+
+    Drops the co-tenant pass too (see :func:`cotenant_sids`). A mutation that
+    invalidates one cache has changed the world the other described, and clearing
+    both here keeps every existing mutation hook correct without each having to
+    know that two caches exist. Pod-lifecycle changes — a pod appearing, being
+    torn down, or rewriting its map — have no hook here and are covered by the
+    TTL alone; that is acceptable because every destructive path re-reads the
+    co-tenant view uncached regardless.
     """
-    global _scan_cache
+    global _scan_cache, _cotenant_cache
     with _scan_cache_lock:
         _scan_cache = None
+    with _cotenant_cache_lock:
+        _cotenant_cache = None
 
 
 def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUnit]:
@@ -402,12 +431,16 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
     Two halves of the answer, deliberately separated. :func:`_scan_raw` does the
     filesystem work and knows nothing about which sessions are in use; this
     applies the caller's index over that result. So the expensive half can be
-    reused (see *cached*) while the answer to "may this be reclaimed" is always
-    computed from the index the caller passed in this call.
+    reused (see *cached*) while the flags derived from the index are always
+    computed from the index the caller passed in this call. ``active`` has one
+    further input — the co-tenant set — which follows *cached* below.
 
-    *cached* permits a recent filesystem pass to be reused. It is for READ paths
-    only: no refusal is derived from the cached half, but a reclaim must not
-    select against a snapshot at all, so every mutation path leaves it False.
+    *cached* permits a recent filesystem pass to be reused — both halves of it:
+    the store scan (:func:`_scan_raw`) and the co-tenant lookup below thread the
+    same flag. It is for READ paths only: every path that derives a refusal from
+    the result (the mutation gates, and the dashboard pre-classification that
+    feeds one) leaves it False, and a reclaim must not select against a snapshot
+    at all, so every mutation path leaves it False too.
     """
     raw = _scan_raw(index.stem_to_sid, cached=cached)
     active_stems = index.active_stems
@@ -417,7 +450,7 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
     # one place every read and every reclaim passes through — measure, the row
     # list, the pre-classification and move_to_trash all derive `active` from it,
     # so one assignment protects all of them. A caller cannot forget to ask.
-    cotenant, _unreadable = cotenant_sids()
+    cotenant, _unreadable = cotenant_sids(cached=cached)
     units = []
     for entry in raw:
         active = (
@@ -690,7 +723,7 @@ def measure(
         trash_bytes=sum(b.bytes for b in batches),
         trash_batches=len(batches),
         trash_same_filesystem=_same_filesystem(kiro_sessions_dir(), trash_root()),
-        reclaim_blocked_reason=reclaim_block_reason(),
+        reclaim_blocked_reason=reclaim_block_reason(cached=True),
     )
     # The per-store split stays out of the report but is the first thing worth
     # knowing when a total looks wrong.
@@ -704,7 +737,7 @@ def measure(
     return report
 
 
-def list_units(index: SessionIndex) -> list[SessionUnit]:
+def list_units(index: SessionIndex, *, cached: bool = True) -> list[SessionUnit]:
     """Every session on disk as one unit each, with its total size and age.
 
     The inventory screen's row source. Exposed separately from :func:`measure`
@@ -715,10 +748,13 @@ def list_units(index: SessionIndex) -> list[SessionUnit]:
     six-figure store. Anything requiring a read (a title's metadata line, a first
     message, a turn or image count) is fetched per row instead.
 
-    A recent scan is reused when there is one: this is a read, and the in-use
-    flags are recomputed from *index* on every call regardless.
+    A recent scan is reused by default: this is a read, and the flags derived
+    from *index* are recomputed on every call regardless. The co-tenant
+    contribution to ``active`` rides the cached half though, so a caller that
+    derives a REFUSAL from the result — the dashboard's trash pre-classification
+    — must pass ``cached=False`` and pay for a fresh pass instead.
     """
-    return _scan_units(index, cached=True)
+    return _scan_units(index, cached=cached)
 
 
 def select_reclaimable(
@@ -769,7 +805,42 @@ def _replay_store_cotenants() -> list[str]:
     )
 
 
-def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+_cotenant_cache_lock = threading.Lock()
+# (expires_at, cache key, (protected sids, refusals))
+_cotenant_cache: (
+    tuple[float, tuple[object, ...], tuple[frozenset[str], tuple[tuple[str, str], ...]]] | None
+) = None
+
+
+def _cotenant_key() -> tuple[object, ...]:
+    """Everything a cached co-tenant pass depends on besides the maps themselves.
+
+    The pod root is part of it, for the same reason the store locations are part
+    of :func:`_scan_key`: it is resolved per call (``KIROCREW_POD_ROOT`` overrides
+    it), so a process can legitimately answer for different roots over its
+    lifetime, and a key without the location would answer a question about one
+    root with a pass taken over another.
+
+    The home overrides are part of it because the answer is not a function of the
+    pod root alone: each map is read through ``hooks.safe_read_file``, whose
+    sensitive-path gate re-anchors on ``KIROCREW_HOME`` / ``KIRO_HOME`` — the
+    same symlinked map can be refused under one anchoring and readable under
+    another, and *refusals* is part of what this cache stores. The RAW env values
+    are keyed, not the sanitized ``data_home()``/``kiro_home()`` forms, because
+    the gate reads them raw with no validity check: an unsafe override and an
+    unset one anchor differently even though both sanitize to the default. Of the
+    two, the read tier re-anchors on ``KIROCREW_HOME``; ``KIRO_HOME`` reaches
+    only the write tier today and is kept as defensive over-keying — a spurious
+    miss costs a re-scan, a spurious hit would cost a wrong answer.
+    """
+    return (
+        str(_pod_root()),
+        os.environ.get("KIROCREW_HOME"),
+        os.environ.get("KIRO_HOME"),
+    )
+
+
+def cotenant_sids(*, cached: bool = False) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
     """Replay-store sessions a co-tenant instance can still resume.
 
     Returns ``(sids, refusals)``. The sids are protected exactly like this
@@ -804,7 +875,23 @@ def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
     Liveness is deliberately not the test anywhere here. A stopped instance's map
     still names sessions it would resume if restarted, so ownership — not whether a
     process is running this second — is what protects them.
+
+    *cached* permits a recent pass over the pod maps to be reused, mirroring
+    :func:`_scan_raw`'s flag: opt-in per call site, never global. It exists for
+    the read paths behind :func:`_scan_units` and display callers of
+    :func:`reclaim_block_reason`. The pre-move re-read in
+    :func:`move_to_trash` (and :func:`reclaim_block_reason`'s default) must
+    never opt in — a stale answer there could let a reclaim proceed against a
+    store another instance still holds, which is the exact staleness the
+    pre-move re-read exists to close.
     """
+    global _cotenant_cache
+    if cached:
+        with _cotenant_cache_lock:
+            if _cotenant_cache is not None:
+                expires, key, result = _cotenant_cache
+                if time.monotonic() < expires and key == _cotenant_key():
+                    return result
     protected: set[str] = set()
     refusals: list[tuple[str, str]] = []
     root = _pod_root()
@@ -827,13 +914,15 @@ def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             # escape past the parse guard below and reach the caller. All four
             # mean the same thing here — which sessions this instance claims
             # cannot be established — so fail closed on it.
-            logger.warning("co-tenant %s has an unreadable session map", name, exc_info=True)
+            # %r, not %s: the directory name is agent-influenced and passes no
+            # identifier gate, so a newline in it would forge a second record.
+            logger.warning("co-tenant %r has an unreadable session map", name, exc_info=True)
             refusals.append((name, "its session map could not be read"))
             continue
         try:
             data = json.loads(raw)
         except ValueError:
-            logger.warning("co-tenant %s has a malformed session map", name)
+            logger.warning("co-tenant %r has a malformed session map", name)
             refusals.append((name, "its session map could not be parsed"))
             continue
         if not isinstance(data, dict):
@@ -867,7 +956,11 @@ def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             refusals.append(
                 (name, "it shares this replay store and can resume sessions at any time")
             )
-    return frozenset(protected), tuple(refusals)
+    result = (frozenset(protected), tuple(refusals))
+    if cached:
+        with _cotenant_cache_lock:
+            _cotenant_cache = (time.monotonic() + _SCAN_CACHE_TTL, _cotenant_key(), result)
+    return result
 
 
 def _has_own_replay_store(pod_home: Path) -> bool:
@@ -882,7 +975,7 @@ def _has_own_replay_store(pod_home: Path) -> bool:
     return (pod_home / KIRO_BASE_DIR_NAME.lstrip(".")).is_dir() or (pod_home / "kiro").is_dir()
 
 
-def reclaim_block_reason() -> str:
+def reclaim_block_reason(*, cached: bool = False) -> str:
     """Why this instance must not reclaim, or ``""`` when it may.
 
     The exclusion set is built from THIS instance's session map, but the kiro-cli
@@ -909,6 +1002,14 @@ def reclaim_block_reason() -> str:
     Pods are handled per session rather than per instance, because their mappings
     ARE discoverable: see :func:`cotenant_sids`. Only a pod whose map cannot be
     read still costs the whole instance its ability to reclaim.
+
+    *cached* permits reusing a recent pass over co-tenant pod mappings,
+    mirroring :func:`cotenant_sids`'s flag: opt-in per call site, never global.
+    It is passed by display aggregators like :func:`measure` to avoid paying an
+    extra uncached scan on top of :func:`list_units`. Mutation paths
+    (like :func:`_move_to_trash_locked`) keep the default ``cached=False`` so the
+    destructive operation always re-evaluates the authoritative state in real
+    time.
     """
 
     def _norm(path: Path) -> Path:
@@ -931,9 +1032,13 @@ def reclaim_block_reason() -> str:
         # retired from here. Only checked when the store is the default one, since
         # that is the only store a pod reads.
         if _norm(kiro_home()) == home / KIRO_BASE_DIR_NAME:
-            _protected, refusals = cotenant_sids()
+            _protected, refusals = cotenant_sids(cached=cached)
             if refusals:
-                listed = "; ".join(f"{name} — {why}" for name, why in refusals[:3])
+                # !r, not plain interpolation: the directory name is
+                # agent-influenced and passes no identifier gate, so a newline
+                # or ANSI payload in it would forge a second record the moment
+                # a caller logs this text (the #6281/#6371 forgery class).
+                listed = "; ".join(f"{name!r} — {why}" for name, why in refusals[:3])
                 return (
                     f"{len(refusals)} other instance(s) sharing this kiro-cli session "
                     f"store make reclaiming unsafe ({listed}). Evict them with "
@@ -1076,29 +1181,40 @@ def _move_file(src: Path, dst: Path) -> None:
         shutil.move(str(src), str(dst))
 
 
-def _file_size(path: Path) -> int:
-    """The size recorded for a staged file. Raises ``OSError`` when unreadable.
+def _file_stamp(path: Path) -> tuple[int, float]:
+    """The size and last-modified time of a file about to be staged.
 
-    A named operation rather than an inline ``stat`` because its failure is
-    load-bearing: a file whose size cannot be read cannot be recorded, and an
-    unrecorded file is one restore cannot put back.
+    Raises ``OSError`` when unreadable. A named operation rather than an inline
+    ``stat`` because both readings are load-bearing and both come from ONE call:
+    a file whose size cannot be read cannot be recorded, and an unrecorded file
+    is one restore cannot put back; the mtime is what tells the move loop the
+    file has been touched since this batch was validated (see
+    :func:`_move_to_trash_locked`). Reading them separately would be two stats
+    describing two instants, which is the class of bug the caller is guarding
+    against.
     """
-    return path.stat().st_size
+    info = path.stat()
+    return info.st_size, info.st_mtime
 
 
-def _rollback(moved: list[tuple[Path, Path]]) -> None:
-    """Undo a partial session move, best effort.
+def _rollback(moved: list[tuple[Path, Path]]) -> bool:
+    """Undo a partial session move, best effort. True if everything went back.
 
     Each pair is (where it landed, where it came from). A rollback that itself
     fails is logged and nothing more: the alternative is raising over a caller
     already handling a failure, which would abandon the rest of the batch too.
+    The return value exists for the one caller that makes a POSITIVE claim about
+    the outcome — "this session was left in place" is only true if every file
+    actually went back — and callers that merely omit a session can ignore it.
 
     The move is EXCLUSIVE. A rollback runs after something already went wrong, so
     the origin may have been recreated in the meantime — and a plain rename would
     replace that newer session data with the copy being put back, turning a handled
     failure into data loss. An occupied origin leaves the file where it is staged,
-    which keeps it recoverable.
+    which keeps it recoverable, and is reported here as an incomplete rollback
+    because the staged copy is then in the batch without being in its manifest.
     """
+    complete = True
     for landed, origin in reversed(moved):
         try:
             if not _move_file_exclusive(landed, origin):
@@ -1107,8 +1223,11 @@ def _rollback(moved: list[tuple[Path, Path]]) -> None:
                     landed,
                     origin,
                 )
+                complete = False
         except OSError:
             logger.warning("could not roll %s back to %s", landed, origin, exc_info=True)
+            complete = False
+    return complete
 
 
 def _staged_path(batch: Path, rel: str) -> Path | None:
@@ -1451,13 +1570,10 @@ def _summarize_manifest(batch: Path) -> tuple[dict[str, Any], int, int] | None:
 
 
 def _rewrite_manifest(batch: Path, header: dict[str, Any], entries: list[dict[str, Any]]) -> None:
-    """Replace a manifest atomically after a partial restore."""
-    tmp = batch / f"{MANIFEST_NAME}.tmp"
-    with tmp.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(header) + "\n")
-        for entry in entries:
-            handle.write(json.dumps(entry) + "\n")
-    os.replace(tmp, batch / MANIFEST_NAME)
+    """Replace and sync a manifest after a partial restore."""
+    header_line = json.dumps(header) + "\n"
+    entry_lines = "".join(json.dumps(entry) + "\n" for entry in entries)
+    atomic_write(batch / MANIFEST_NAME, header_line + entry_lines, fsync=True)
 
 
 def _entry_bytes(entry: dict[str, Any]) -> int:
@@ -1497,6 +1613,13 @@ def move_to_trash(
     would then treat it as retired. The two active sets are UNIONED, never
     replaced, so a re-read can only ever add protection.
 
+    That re-read still describes one instant, and the move loop after it is not
+    instant. A session resumed anywhere in that stretch is caught in the loop
+    instead: each file is already stat'd for the manifest, so a source modified
+    since the reclaim began marks its session as revived and leaves it in place.
+    The returned batch names those sessions in ``revived`` — they were asked for
+    and not taken.
+
     Serialized against other mutations, because two interleaved reclaims can put
     one half of a session in each batch and leave neither able to restore it.
     """
@@ -1528,11 +1651,35 @@ def _move_to_trash_locked(
     and moving its files out from under a live slot breaks it with no error a user
     would connect to this action.
 
+    Every such check runs before the move loop, so each describes the instant it
+    ran. The loop closes the remaining window itself, against an instant taken
+    before any of them: a source file whose mtime is newer than that has been
+    written to since the reads that certified it, which an idle session's file
+    cannot be, so the whole session is left in place and named in
+    ``TrashBatch.revived``.
+
     Each session is recorded as it lands, so an interruption leaves a manifest
     describing exactly what moved — a partial batch stays restorable instead of
     becoming orphaned files nothing points at.
     """
     clock = time.time() if now is None else now
+    # Anchor for the move loop's revival check, taken BEFORE the scan and before
+    # every authority check below — not after them. Everything this function is
+    # about to reason over is read after this instant, so a source file written
+    # later than it may have been written after the read that certified it, and
+    # the loop must not trust that file. Stamping after the checks would leave
+    # exactly that gap: a session resumed during the scan, or between the index
+    # re-read and the loop, would carry an mtime older than the stamp and be
+    # staged.
+    #
+    # Taking it this early costs nothing in false positives. A candidate has to be
+    # untouched for MIN_RECLAIM_AGE_DAYS to qualify at all, so a legitimate one's
+    # mtime is days older than this stamp however early it is taken.
+    #
+    # Deliberately real wall-clock rather than *clock*: a caller may inject
+    # ``now`` (tests do), and this is compared against an mtime the kernel writes,
+    # so it has to measure elapsed reality.
+    validated_at = time.time()
     blocked_reason = reclaim_block_reason()
     if blocked_reason:
         raise SessionStorageError(blocked_reason)
@@ -1576,9 +1723,13 @@ def _move_to_trash_locked(
     cotenant_now, refusals = cotenant_sids()
     if refusals:
         name, why = refusals[0]
+        # name!r, not plain interpolation: the directory name is agent-influenced
+        # and passes no identifier gate, so a newline or ANSI payload in it would
+        # forge a second record the moment a caller logs str(exc) (the
+        # #6281/#6371 forgery class).
         raise SessionStorageError(
             f"{len(refusals)} instance(s) sharing this session store make reclaiming "
-            f"unsafe ({name} — {why}); nothing was moved"
+            f"unsafe ({name!r} — {why}); nothing was moved"
         )
     live_sids = live_sids | cotenant_now
 
@@ -1617,6 +1768,7 @@ def _move_to_trash_locked(
 
     moved_bytes = 0
     moved_sessions = 0
+    revived: list[str] = []
     staged_dirs: set[Path] = set()
     cli_files = _cli_index()
     with (target / MANIFEST_NAME).open("w", encoding="utf-8") as manifest:
@@ -1628,9 +1780,10 @@ def _move_to_trash_locked(
             files: list[dict[str, Any]] = []
             done: list[tuple[Path, Path]] = []
             failed = False
+            woke = False
             for src, rel in _unit_paths(unit.sid, unit.stems, archives, cli_files):
                 try:
-                    size = _file_size(src)
+                    size, mtime = _file_stamp(src)
                 except OSError:
                     # A file that cannot be sized cannot be recorded, and a file
                     # the manifest does not record is one restore cannot put back.
@@ -1638,6 +1791,22 @@ def _move_to_trash_locked(
                     # this loop's rollback exists to prevent, so it is a failure.
                     logger.warning("could not stat %s for staging", src, exc_info=True)
                     failed = True
+                    break
+                if mtime > validated_at:
+                    # Every authority check ran before the loop, and moving a
+                    # six-figure store is not instant, so a session can be resumed
+                    # between being certified retired and being reached here. Its
+                    # replay log is then written to, and this is the one signal of
+                    # that which costs nothing: the stat is already being taken for
+                    # the manifest.
+                    #
+                    # A candidate qualified by being untouched for
+                    # MIN_RECLAIM_AGE_DAYS, so an mtime newer than the instant we
+                    # certified it cannot be the same idle file — something has it
+                    # open. Leave the whole session alone rather than any part of
+                    # it: staging half is the split the rollback below exists to
+                    # prevent, and the half left behind would be the live half.
+                    woke = True
                     break
                 dst = target / rel
                 if dst.parent not in staged_dirs:
@@ -1651,6 +1820,46 @@ def _move_to_trash_locked(
                     break
                 done.append((dst, src))
                 files.append({"rel": rel, "origin": str(src), "bytes": size})
+            if woke:
+                # Put back whatever already moved for this session: the point of
+                # leaving it alone is that it stays resumable, and half a session
+                # is not.
+                if not _rollback(done):
+                    # The rollback could not finish — most plausibly because the
+                    # resume that triggered this recreated an origin, and putting a
+                    # file back is deliberately non-overwriting. Two things then
+                    # have to be true before this returns.
+                    #
+                    # First, whatever is still staged must be IN the manifest.
+                    # Unlisted files in a batch are reachable by nothing: restore
+                    # enumerates the manifest, and so does empty. Recording them is
+                    # safe because restore moves exclusively too, so a later restore
+                    # declines the origin the resume recreated rather than
+                    # overwriting the live session with this stale copy.
+                    stranded = [
+                        record for record, (landed, _origin) in zip(files, done) if landed.exists()
+                    ]
+                    if stranded:
+                        try:
+                            _append_entry(manifest, {"uid": uid, "files": stranded})
+                        except OSError:
+                            logger.warning(
+                                "could not record the stranded half of %r; it is in %s",
+                                uid,
+                                target,
+                                exc_info=True,
+                            )
+                    # Second, this must not be reported as a revival. "Left in
+                    # place" would be false, so raise instead — matching how this
+                    # module already treats a file it could not put back — and name
+                    # the batch so the fragment can be found.
+                    raise SessionStorageError(
+                        f"session {uid!r} was resumed while being staged and could "
+                        f"not be fully put back; what is still staged is recorded in "
+                        f"{target} and can be restored"
+                    )
+                revived.append(uid)
+                continue
             if failed:
                 # A session that moved only partly is the broken state this module
                 # exists to prevent, and it would be invisible: the manifest would
@@ -1680,6 +1889,17 @@ def _move_to_trash_locked(
                 moved_sessions += 1
                 moved_bytes += sum(int(record["bytes"]) for record in files)
 
+    if revived:
+        # Reported, not just skipped: the endpoint's own rule is that doing less
+        # than the user asked without saying so is a defect. uid!r because a unit
+        # id reaching here has passed _validate_unit_id, but the log line is read
+        # by people who also read agent-influenced names, so keep it quoted.
+        logger.warning(
+            "left %d session(s) in place: resumed while staging (first: %r)",
+            len(revived),
+            revived[0],
+        )
+
     if not moved_sessions:
         # Leave no empty batch behind — but a rollback that itself failed can have
         # left staged files here, and those are the only copy.
@@ -1688,6 +1908,14 @@ def _move_to_trash_locked(
                 "no sessions were staged, and some files could not be put back; " f"see {target}"
             )
         shutil.rmtree(target, ignore_errors=True)
+        if revived:
+            # A distinct message from "not found": every selected session is still
+            # exactly where the caller left it, and it is still resumable. Saying
+            # "none were found" here would send someone looking for lost files.
+            raise SessionStorageError(
+                f"all {len(revived)} selected session(s) were resumed while being "
+                "staged; nothing was moved"
+            )
         raise SessionStorageError("none of the selected sessions were found on disk")
 
     return TrashBatch(
@@ -1696,6 +1924,7 @@ def _move_to_trash_locked(
         reason=reason,
         sessions=moved_sessions,
         bytes=moved_bytes,
+        revived=tuple(revived),
     )
 
 

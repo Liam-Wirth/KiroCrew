@@ -50,6 +50,7 @@ from kiro_crew.instances.registry import (
     validate_ttl,
 )
 from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError, TunnelState
+from kiro_crew.instances.warm_set import resolve_warm_set_cap
 from kiro_crew.sel import sel
 from kiro_crew.validation import sanitize_string
 
@@ -80,6 +81,33 @@ def _audit(operation: str, outcome: str, *, request_id: str = "", error: str = "
         )
     except Exception:  # audit must never break the request path
         logger.debug("SEL audit failed for instances_%s", operation, exc_info=True)
+
+
+# The addressing fields Stop/Start/Delete resolve the real EC2 stack through
+# (see coordsOf() in RemoteCrewPanel.tsx). Locked from PATCH for a correlated
+# cloud instance — see _is_correlated_cloud_instance().
+_ADDRESSING_FIELDS = {"connection_method", "ssm_target", "aws_profile", "aws_region"}
+
+
+def _is_correlated_cloud_instance(ssm_target: str) -> bool:
+    """True if *ssm_target* was provisioned by a Kiro Crew cloud launch.
+
+    Deferred import: this is the one place the instances feature reaches into
+    the cloud module, kept lazy so instances stays usable with the cloud
+    module unavailable/import-broken (mirrors register_instance()'s own
+    best-effort posture in cloud/connect.py). Only the import itself is
+    best-effort (``ImportError`` -> not correlated, the "cloud feature
+    absent" case) — a launch-job STORE read failure inside
+    ``is_launched_instance()`` is a different failure mode and is NOT caught
+    here, so it propagates to ``api_instances_update``, which fails the PATCH
+    CLOSED rather than silently treating a possibly-launched instance as
+    uncorrelated.
+    """
+    try:
+        from kiro_crew.cloud.connect import is_launched_instance
+    except ImportError:  # pragma: no cover - cloud feature absent
+        return False
+    return is_launched_instance(ssm_target)
 
 
 def _is_slack_origin(request: web.Request) -> bool:
@@ -183,6 +211,11 @@ async def api_instances_list(request: web.Request) -> web.Response:
     # instances.json under a threading lock a to_thread worker may hold across
     # its fsync — so every registry touch in these handlers goes off the loop.
     items = [_instance_view(state, i) for i in await asyncio.to_thread(reg.list)]
+    # Resolved here rather than served raw: the automatic mode (0) means "as many
+    # as are connected", and this is the only place that holds both the stored
+    # value and the live per-instance status. The browser therefore always
+    # receives a concrete integer and needs no notion of automatic.
+    connected = sum(1 for i in items if (i.get("status") or {}).get("state") == "connected")
     _audit("list", "success")
     return web.json_response(
         {
@@ -193,7 +226,9 @@ async def api_instances_list(request: web.Request) -> web.Response:
             # active, the UI shows a "restart the gateway to activate" hint.
             "active": getattr(state, "instances_manager", None) is not None,
             "instances": items,
-            "warm_set_cap": KiroCrewConfig.load().instances.warm_set_cap,
+            "warm_set_cap": resolve_warm_set_cap(
+                KiroCrewConfig.load().instances.warm_set_cap, connected
+            ),
         }
     )
 
@@ -240,9 +275,11 @@ async def api_instances_add(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
+        return web.json_response({"error": "invalid JSON body", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
-        return web.json_response({"error": "body must be an object"}, status=400)
+        return web.json_response(
+            {"error": "body must be an object", "code": "invalid_body"}, status=400
+        )
     try:
         inst = await asyncio.to_thread(
             reg.add,
@@ -258,12 +295,20 @@ async def api_instances_add(request: web.Request) -> web.Response:
             aws_region=str(body.get("aws_region", "")),
             instance_id=body.get("id"),
         )
-    except (DuplicateInstanceError, InvalidInstanceError) as e:
+    except DuplicateInstanceError as e:
+        # Split from InvalidInstanceError because the two are different user
+        # actions: a name collision is resolved by renaming, a rejected field by
+        # correcting it. A client that cannot tell them apart has to parse prose.
         _audit("add", "denied", error=str(e))
-        return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"error": str(e), "code": "instance_duplicate"}, status=400)
+    except InvalidInstanceError as e:
+        _audit("add", "denied", error=str(e))
+        return web.json_response({"error": str(e), "code": "instance_invalid"}, status=400)
     except (TypeError, ValueError) as e:
         _audit("add", "denied", error=str(e))
-        return web.json_response({"error": f"invalid field: {e}"}, status=400)
+        return web.json_response(
+            {"error": f"invalid field: {e}", "code": "invalid_field"}, status=400
+        )
     _audit("add", "success", request_id=inst.id)
     return web.json_response(_instance_view(state, inst), status=201)
 
@@ -347,6 +392,70 @@ async def api_instances_update(request: web.Request) -> web.Response:
     if current is None:
         _audit("update", "denied", request_id=instance_id, error="not found")
         return web.json_response({"error": "not found", "code": "instance_not_found"}, status=404)
+    # Addressing fields resolve the real EC2 stack for Stop/Start/Delete, so
+    # editing them on an instance Kiro Crew launched would strand a running,
+    # billing instance with no dashboard path to reach it. Checked against the
+    # `current` record already fetched above rather than re-reading the
+    # registry, so this costs no extra (blocking) lookup.
+    # Split rather than `and`-chained: mypy unifies the operand types of an
+    # `and` expression, so folding the set-intersection test into the same
+    # condition makes it infer to_thread's callable as returning set[str].
+    correlated = False
+    if _ADDRESSING_FIELDS & set(changes):
+        try:
+            correlated = await asyncio.to_thread(_is_correlated_cloud_instance, current.ssm_target)
+        except Exception as exc:
+            # The correlation check is what stands between a caller and
+            # rewriting a launched instance's addressing fields out from
+            # under Stop/Start/Delete, so a lookup failure here fails CLOSED
+            # (refuse the edit, persist nothing) instead of falling back to
+            # `correlated = False` and risking the exact stranding this lock
+            # exists to prevent.
+            logger.info(
+                "correlation check failed for instance %r, refusing addressing edit: %s",
+                instance_id,
+                exc,
+            )
+            _audit(
+                "update",
+                "denied",
+                request_id=instance_id,
+                error=f"correlation check failed: {exc}",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        "could not determine whether this instance's addressing "
+                        "fields are locked (cloud launch store unreadable) — "
+                        "refusing to edit connection_method/ssm_target/"
+                        "aws_profile/aws_region; retry once the store is "
+                        "reachable"
+                    ),
+                    "code": "cloud_instance_correlation_check_failed",
+                },
+                status=503,
+            )
+    if correlated:
+        _audit(
+            "update",
+            "denied",
+            request_id=instance_id,
+            error="addressing fields locked: correlated cloud instance",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    "connection_method/ssm_target/aws_profile/aws_region cannot be "
+                    "edited on an instance Kiro Crew launched — Stop/Start/Delete "
+                    "resolve the real EC2 stack through these fields, so changing "
+                    "them here would strand a running, billing instance with no "
+                    "dashboard path to reach it"
+                ),
+                "code": "cloud_instance_addressing_locked",
+            },
+            status=400,
+        )
+
     transport_changed = any(
         k in transport_keys and v != getattr(current, k) for k, v in changes.items()
     )
@@ -454,6 +563,25 @@ async def api_instances_remove(request: web.Request) -> web.Response:
     return web.json_response({"removed": instance_id})
 
 
+def _connect_failure_code(body: dict, fallback: str) -> str:
+    """Machine-readable ``code`` for a failed connect response.
+
+    Promotes the failure-diagnosis ladder's own verdict (``ssh_unreachable``,
+    ``remote_down``, ``tunnel_down``, …) to the top level, where a client reads
+    it without walking into ``diagnosis``. Only a verdict that is present AND
+    negative is promoted: the stored diagnosis is the last ladder RUN, so a stale
+    ``ok`` from before the failure would otherwise be published as this call's
+    reason. Without a usable verdict the caller's *fallback* names the stage that
+    failed instead.
+    """
+    diagnosis = body.get("diagnosis")
+    if isinstance(diagnosis, dict) and not diagnosis.get("ok"):
+        code = diagnosis.get("code")
+        if isinstance(code, str) and code:
+            return code
+    return fallback
+
+
 async def api_instances_connect(request: web.Request) -> web.Response:
     """POST /api/instances/{id}/connect — open tunnel + mint token.
 
@@ -468,12 +596,15 @@ async def api_instances_connect(request: web.Request) -> web.Response:
     mgr = getattr(state, "instances_manager", None)
     if mgr is None:
         _audit("connect", "denied", request_id=instance_id, error="manager unavailable")
-        return web.json_response({"error": "instances manager not running"}, status=503)
+        return web.json_response(
+            {"error": "instances manager not running", "code": "instances_manager_unavailable"},
+            status=503,
+        )
     try:
         status = await mgr.connect(instance_id)
     except KeyError:
         _audit("connect", "denied", request_id=instance_id, error="not found")
-        return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"error": "not found", "code": "instance_not_found"}, status=404)
     body = status.to_dict()
     if status.state.value == "connected":
         token = mgr.get_token(instance_id)
@@ -499,11 +630,13 @@ async def api_instances_connect(request: web.Request) -> web.Response:
                     error="token unconfirmed and re-mint failed",
                 )
                 body["error"] = "token expired and re-mint failed"
+                body["code"] = _connect_failure_code(body, "instance_token_unconfirmed")
                 return web.json_response(body, status=502)
         body["token"] = token  # delivered to owner only
         _audit("connect", "success", request_id=instance_id)
         return web.json_response(body)
     _audit("connect", "failure", request_id=instance_id, error=status.error)
+    body["code"] = _connect_failure_code(body, "instance_connect_failed")
     return web.json_response(body, status=502)
 
 
@@ -614,22 +747,21 @@ async def api_instances_search_sessions(request: web.Request) -> web.Response:
     # so it requires the positively-identified OWNER: not an app token, and not
     # a Slack user who minted a dashboard token via `!dashboard` (app == "" but
     # a non-owner subject).
-    from kiro_crew.dashboard.handlers.source_providers import (
-        is_owner_dashboard_request,
-        stale_owner_session_response,
-    )
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 
     if not is_owner_dashboard_request(request):
+        # Domain audit stays here rather than delegating to
+        # ``require_owner_dashboard_request``: ``_audit`` emits
+        # ``log_tool_invocation`` under ``instances_search_sessions`` /
+        # ``dashboard:instances``, which is the record this module's SEL consumers
+        # watch, and the shared helper's generic ``log_api_access`` /
+        # ``non_owner_block`` would silently drop this route out of that stream.
+        # Only the denial TAIL is shared -- see ``_owner_denial_response``.
         _audit("search_sessions", "denied", error="non-owner identity rejected")
         # Deny decision made above; only the response label changes for a signed
         # pre-owner bootstrap subject (see stale_owner_session_response).
-        stale = stale_owner_session_response(request)
-        if stale is not None:
-            return stale
-        return web.json_response(
-            {"error": "federated session search is owner-only", "code": "owner_only"},
-            status=403,
-        )
+        return _owner_denial_response(request, "federated session search is owner-only")
     state: DashboardState = request.app["state"]
     q = sanitize_string(request.query.get("q", "")).strip()[:256]
     if len(q) < SEARCH_MIN_CHARS:
@@ -855,12 +987,13 @@ async def api_instances_send_session(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # The source is NOT flushed before bundling. A copy leaves the source
-    # untouched, and build_transfer_bundle already merges the on-disk transcript
-    # with the unflushed in-memory tail — so a flush here would add nothing
-    # except a duplication bug: save_slot_off_loop writes the tail to disk
-    # without clearing ``_dirty``, after which the bundle re-appends that same
-    # tail from memory and every unsaved turn lands twice in the copy.
+    # No flush HERE: the builder owns it. ``build_transfer_bundle_async`` flushes
+    # a dirty slot itself (best_effort=False) and only then takes its boundary
+    # slice, so by that point the tail is empty and the bundle comes wholly from
+    # disk. A flush at this call site would add nothing — and the version of this
+    # code that flushed here and then sliced on ``_resumed_count``, which the save
+    # does NOT advance, is what re-appended the same tail from memory and landed
+    # every unsaved turn twice in the copy.
     try:
         bundle = await build_transfer_bundle_async(state, slot, origin=local_instance_label())
     except SnapshotUnstable:
@@ -956,6 +1089,47 @@ _URL_PATH_SEP = "/"
 # separately, since that is traversal rather than a name.
 _PROXY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:@!$&'()*+,;=-]+$")
 
+# The peer surface the proxy will forward, as canonical segment prefixes — a
+# positive ALLOWLIST, one named prefix per row. The proxy carries the
+# remote-crew chat view and nothing else, so only the peer's `api/chat`
+# subtree and its `api/stream` event feed are reachable (each a prefix grant:
+# every route under it, including mutating ones — that breadth is the chat
+# feature's own wire surface).
+# Everything outside the named prefixes is refused — including the peer's own
+# `api/instances` control plane (no chaining a hub through a peer into a
+# third machine) and the peer's token-minting routes, whose JSON replies
+# would otherwise carry a minted peer credential back through the hub
+# in-band.
+#
+# `api/stream` is the peer's own SSE broadcast endpoint (its `api_stream`
+# handler), the out-of-turn half of the chat view: the per-turn reply streams
+# back from `api/chat`, while session-list and slot-state changes arrive here.
+# It is deliberately SSE and not the sibling `api/ws`: a WebSocket row would
+# need a `101 Switching Protocols` to cross this proxy, and the reply
+# content-type gate below exists precisely to stop a peer serving anything but
+# JSON/SSE onto the authenticated hub origin — an upgrade would tunnel straight
+# through it. A GET returning `text/event-stream` needs no such exception.
+#
+# Note what this row admits: that feed is per-CLIENT but not per-slot, so a hub
+# holding it receives the peer's whole notification/slot broadcast, not only the
+# session on screen. That is peer content crossing to a hub user who is already
+# the peer's owner (this route is owner-only), so it widens VOLUME, not
+# privilege — but it is the reason this is a named row rather than a blanket
+# `api/` grant.
+#
+# A new prefix is added HERE explicitly, never by widening the policy back to
+# deny-only. The constant's exact value and row shape are pinned by tests.
+_PROXY_ALLOWED_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("api", "chat"),
+    ("api", "stream"),
+)
+
+# Derived from the allowlist so the refusal (and its SEL audit line) stays
+# honest as rows are added.
+_PROXY_PATH_DENIED_REASON = "path is outside the proxied peer surface (%s)" % ", ".join(
+    _URL_PATH_SEP.join(prefix) for prefix in _PROXY_ALLOWED_PREFIXES
+)
+
 
 def _proxy_canonical_path(raw: str) -> tuple[str, str]:
     """Canonicalize *raw* into a forwardable path, or return a denial reason.
@@ -972,11 +1146,12 @@ def _proxy_canonical_path(raw: str) -> tuple[str, str]:
     So: decode to a fixed point FIRST, admit only plainly-named segments, and
     rebuild the outbound path from exactly the segments that were vetted. The
     proxy exists for the remote-crew chat surface, not as a general tunnel-HTTP
-    escape hatch, so the vetted shape is narrow on purpose — only the peer's
-    ``/api/`` surface is reachable, and its own ``/api/instances`` control plane
-    is off-limits (proxying into it would let one hub chain through a peer into
-    a third machine's SSH control plane, and recurse through the peer's own
-    proxy route).
+    escape hatch, so the vetted shape is narrow on purpose — only the prefixes
+    in `_PROXY_ALLOWED_PREFIXES` are forwarded. Allowing the needed surface
+    (rather than denying known-bad prefixes) is what keeps every peer route the
+    feature never asked for — the `api/instances` control plane, the peer's
+    token-minting routes, anything added to the peer later — unreachable by
+    default instead of proxied silently.
     """
     path = raw
     for _ in range(PROXY_PATH_MAX_DECODE_PASSES):
@@ -998,11 +1173,14 @@ def _proxy_canonical_path(raw: str) -> tuple[str, str]:
             return "", "path traversal"
         if not _PROXY_SEGMENT_RE.match(seg):
             return "", "illegal character in path segment"
-    if segments[0] != "api":
-        return "", "only the peer /api/ surface is proxied"
-    if len(segments) > 1 and segments[1] == "instances":
-        return "", "peer instances control plane is not proxied (no chaining)"
-    return _URL_PATH_SEP.join(segments), ""
+    for prefix in _PROXY_ALLOWED_PREFIXES:
+        # A malformed row must fail CLOSED: an empty row would prefix-match
+        # everything and a one-segment ("api",) row would restore the whole
+        # peer /api/ surface. Rows shallower than two segments are ignored
+        # here (and refused by the constant's shape test).
+        if len(prefix) >= 2 and tuple(segments[: len(prefix)]) == prefix:
+            return _URL_PATH_SEP.join(segments), ""
+    return "", _PROXY_PATH_DENIED_REASON
 
 
 async def api_instances_proxy(request: web.Request) -> web.StreamResponse:
@@ -1025,19 +1203,17 @@ async def api_instances_proxy(request: web.Request) -> web.StreamResponse:
     # with the OWNER's manager-held credential, so it requires the positively
     # identified owner — the same bar api_instances_search_sessions sets, for
     # the same reason.
-    from kiro_crew.dashboard.handlers.source_providers import (
-        is_owner_dashboard_request,
-        stale_owner_session_response,
-    )
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 
     if not is_owner_dashboard_request(request):
+        # Domain audit stays here for the same reason as
+        # api_instances_search_sessions above: ``_audit`` is this module's
+        # ``instances_*`` SEL stream. Only the denial tail is shared.
         _audit("proxy", "denied", error="non-owner identity rejected")
-        stale = stale_owner_session_response(request)
-        if stale is not None:
-            return stale
-        return web.json_response(
-            {"error": "remote-crew proxy is owner-only", "code": "owner_only"}, status=403
-        )
+        # Deny decision made above; only the response label changes for a signed
+        # pre-owner bootstrap subject (see stale_owner_session_response).
+        return _owner_denial_response(request, "remote-crew proxy is owner-only")
     state: DashboardState = request.app["state"]
     instance_id = request.match_info["id"]
     path = request.match_info.get("path", "")

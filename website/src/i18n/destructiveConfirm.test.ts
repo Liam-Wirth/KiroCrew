@@ -171,6 +171,7 @@ describe('destructive confirmations are translated', () => {
  */
 export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'apps.awsControl.console.delete_confirm', // filename operand, quoted per locale
+  'apps.awsControl.console.folder_delete_confirm', // folder-name operand, quoted per locale #4821
   'apps.codeReviewSage.components.learningRail.confirm_delete', // quoted since #4653
   'apps.crewCompanion.gallery.deleteConfirm', // ASCII quotes → locale pair #4821
   'apps.mdNotebook.row.deleteTitle', // already quoted; pin + fr NNBSP fix #5725
@@ -225,6 +226,9 @@ export const EXEMPT_CONFIRM_PLACEHOLDER_NAMES = new Set([
   'resources',
   'bucket',
   'distribution',
+  // Set once by the edition's composition root (i18next defaultVariables),
+  // never user-supplied, so it cannot smuggle prose into a confirm sentence.
+  'productName',
 ])
 
 /**
